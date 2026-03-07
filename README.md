@@ -66,13 +66,14 @@ A runnable program that exercises everything end-to-end:
 | Step | Package | Description |
 |------|---------|-------------|
 | 5 | `internal/network` | Gossip protocol for peer discovery and CRDT state sync between nodes (probably using HashiCorp memberlist) |
-| 6 | `internal/dht` | Distributed hash table — maps communities to responsible nodes |
-| 7 | `internal/community` | Community manager — ties storage + CRDTs + Raft together per community |
-| 8 | `internal/node` | Node orchestrator — manages all communities on a single node, handles joins/leaves |
-| 9 | `internal/api` | HTTP REST API — endpoints for creating posts, voting, moderating, etc. |
-| 10 | `cmd/dreddit` | CLI + main binary — the thing you actually run |
+| 6 | `internal/dht` | Distributed hash table: maps communities to responsible nodes |
+| 7 | `internal/community` | Community manager: ties storage + CRDTs + Raft together per community |
+| 8 | `internal/node` | Node orchestrator: manages all communities on a single node, handles joins/leaves |
+| 9 | `internal/api` | HTTP REST API: endpoints for creating posts, voting, moderating, etc. |
+| 10 | `cmd/dreddit` | CLI + main binary |
+| 11 | `ui/` | Web UI — browse communities, create posts, vote, and manage moderation from a browser |
 
-Right now everything runs inside a single process (the demo). Steps 5-6 add real networking to make it actually distributed. Steps 7-8 wire everything together. Steps 9-10 give it a usable interface.
+Right now everything runs inside a single process (the demo). Steps 5-6 add real networking to make it actually distributed. Steps 7-8 wire everything together. Steps 9-10 give it a usable interface. Step 11 adds a proper web frontend on top of the HTTP API.
 
 ## Running
 
@@ -109,10 +110,11 @@ Distributed-Reddit/
 ```
 
 ## Tech Stack
-- **Go** — all code
+- **Go** — all backend code
 - **HashiCorp Raft** — consensus protocol for moderation
 - **SHA-256** — content-addressed hashing
 - **JSON** — serialization and disk persistence
+- **Web UI** — frontend (TBD)
 
 ## References
 - DReddit: A Decentralized Reddit — Saiteja Poluka, Shanmukha Vamshi Kuruba, Jayanth Vunnam (University of Colorado Boulder)
