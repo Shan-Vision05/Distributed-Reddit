@@ -10,6 +10,7 @@ import (
 
 	"github.com/Shan-Vision05/Distributed-Reddit/internal/consensus"
 	"github.com/Shan-Vision05/Distributed-Reddit/internal/crdt"
+	"github.com/Shan-Vision05/Distributed-Reddit/internal/dht"
 	"github.com/Shan-Vision05/Distributed-Reddit/internal/models"
 	"github.com/Shan-Vision05/Distributed-Reddit/internal/network"
 	"github.com/Shan-Vision05/Distributed-Reddit/internal/storage"
@@ -23,6 +24,7 @@ func main() {
 	demoCRDTs()
 	demoRaft()
 	demoNetwork()
+	demoDHT()
 
 	fmt.Println()
 	fmt.Println("  All demos completed successfully!")
@@ -447,6 +449,158 @@ func demoNetwork() {
 
 	info("Node 1 score", "%d (after CRDT merge)", score1)
 	info("Node 2 score", "%d (after CRDT merge)", score2)
+
+	fmt.Println()
+}
+
+func demoDHT() {
+	section("5. DHT — Community-to-Node Mapping via Consistent Hashing")
+	fmt.Println()
+
+	// Create DHT with 5 nodes
+	d := dht.NewCommunityDHT(dht.DHTConfig{VirtualNodes: 150, ReplicationFactor: 3})
+	nodeNames := []string{"node-stark", "node-parker", "node-banner", "node-rogers", "node-romanoff"}
+
+	for _, name := range nodeNames {
+		d.AddNode(&models.NodeInfo{
+			ID:      models.NodeID(name),
+			Address: "127.0.0.1",
+			IsAlive: true,
+		})
+	}
+
+	info("Cluster", "%d nodes, %d virtual nodes on ring, replication=%d",
+		d.NodeCount(), d.RingSize(), d.ReplicationFactor())
+
+	// Show community-to-node mappings
+	communities := []models.CommunityID{
+		"golang", "rust", "distributed-systems", "avengers", "gaming",
+		"science", "memes", "music", "crypto", "linux",
+	}
+
+	subsection("Ring-based Community Routing")
+	for _, cid := range communities {
+		nodes := d.LookupNodes(cid)
+		primary, _ := d.GetPrimaryNode(cid)
+		replicas := make([]string, len(nodes))
+		for i, n := range nodes {
+			s := string(n)
+			if n == primary {
+				s += " (primary)"
+			}
+			replicas[i] = s
+		}
+		info(string(cid), "%s", strings.Join(replicas, ", "))
+	}
+
+	// Show distribution balance
+	subsection("Load Distribution (primary ownership)")
+	dist := d.GetDistribution(communities)
+	for _, name := range nodeNames {
+		id := models.NodeID(name)
+		count := dist[id]
+		bar := strings.Repeat("█", count)
+		info(name, "%d communities %s", count, bar)
+	}
+
+	// Demonstrate explicit assignment override
+	subsection("Explicit Assignment Override")
+	info("Before", "%v", d.LookupNodes("avengers"))
+	err := d.AssignCommunity("avengers", []models.NodeID{"node-stark", "node-rogers"})
+	if err != nil {
+		info("Error", "%v", err)
+	} else {
+		info("Assigned", "avengers → [node-stark, node-rogers]")
+		info("After", "%v", d.LookupNodes("avengers"))
+	}
+	d.UnassignCommunity("avengers")
+	info("Unassigned", "avengers falls back to ring: %v", d.LookupNodes("avengers"))
+
+	// Demonstrate consistent hashing property: add a node, see minimal disruption
+	subsection("Consistent Hashing — Node Join")
+	preMappings := make(map[models.CommunityID]models.NodeID)
+	for _, cid := range communities {
+		p, _ := d.GetPrimaryNode(cid)
+		preMappings[cid] = p
+	}
+
+	d.AddNode(&models.NodeInfo{ID: "node-fury", Address: "127.0.0.1", IsAlive: true})
+	info("Added", "node-fury (now %d nodes)", d.NodeCount())
+
+	changed := 0
+	for _, cid := range communities {
+		p, _ := d.GetPrimaryNode(cid)
+		if p != preMappings[cid] {
+			changed++
+			info(string(cid), "moved %s → %s", preMappings[cid], p)
+		}
+	}
+	info("Disruption", "%d/%d communities changed primary (%.0f%%)",
+		changed, len(communities), float64(changed)/float64(len(communities))*100)
+
+	// Demonstrate node removal
+	subsection("Consistent Hashing — Node Leave")
+	preMappings2 := make(map[models.CommunityID]models.NodeID)
+	for _, cid := range communities {
+		p, _ := d.GetPrimaryNode(cid)
+		preMappings2[cid] = p
+	}
+
+	d.RemoveNode("node-banner")
+	info("Removed", "node-banner (now %d nodes)", d.NodeCount())
+
+	changed2 := 0
+	for _, cid := range communities {
+		p, _ := d.GetPrimaryNode(cid)
+		if p != preMappings2[cid] {
+			changed2++
+			info(string(cid), "moved %s → %s", preMappings2[cid], p)
+		}
+	}
+	info("Disruption", "%d/%d communities changed primary (%.0f%%)",
+		changed2, len(communities), float64(changed2)/float64(len(communities))*100)
+
+	// DHT + Storage integration mini-demo
+	subsection("DHT-Routed Storage")
+	stores := make(map[models.NodeID]*storage.ContentStore)
+	for _, n := range d.GetNodes() {
+		cs, _ := storage.NewContentStore("")
+		stores[n.ID] = cs
+	}
+
+	communityID := models.CommunityID("golang")
+	responsible := d.LookupNodes(communityID)
+	post := &models.Post{
+		CommunityID: communityID,
+		AuthorID:    "demo-user",
+		Title:       "DHT routes this post!",
+		Body:        "Stored only on responsible nodes determined by the hash ring.",
+		CreatedAt:   time.Now(),
+	}
+
+	var postHash models.ContentHash
+	for _, nodeID := range responsible {
+		h, _ := stores[nodeID].StorePost(post)
+		postHash = h
+	}
+
+	info("Post stored", "hash=%s", truncHash(postHash))
+	info("Stored on", "%v", responsible)
+
+	// Verify storage
+	for _, n := range d.GetNodes() {
+		has := stores[n.ID].HasPost(postHash)
+		isResp := d.IsResponsible(n.ID, communityID)
+		status := "no post (not responsible)"
+		if has && isResp {
+			status = "has post ✓ (responsible)"
+		} else if !has && isResp {
+			status = "MISSING! (should have it)"
+		} else if has && !isResp {
+			status = "has post (unexpected)"
+		}
+		info(string(n.ID), "%s", status)
+	}
 
 	fmt.Println()
 }
