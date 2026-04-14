@@ -321,3 +321,62 @@ func (vs *VoteState) ApplyVote(vote models.Vote, nodeID models.NodeID) {
 func (vs *VoteState) GetScore() int64 {
 	return vs.Score.Value()
 }
+
+// Merge merges another VoteState into this one using CRDT semantics.
+func (vs *VoteState) Merge(other *VoteState) {
+	if other == nil || vs.TargetHash != other.TargetHash {
+		return
+	}
+
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+
+	// Merge the score counters
+	vs.Score.Merge(other.Score)
+
+	// Merge user votes (LWW registers)
+	for userID, otherReg := range other.UserVotes {
+		if existingReg, ok := vs.UserVotes[userID]; ok {
+			existingReg.Merge(otherReg)
+		} else {
+			// Copy the register
+			vs.UserVotes[userID] = &LWWRegister{
+				Value:     otherReg.Value,
+				Timestamp: otherReg.Timestamp,
+				NodeID:    otherReg.NodeID,
+			}
+		}
+	}
+}
+
+// Clone creates a deep copy of the VoteState for safe transmission.
+func (vs *VoteState) Clone() *VoteState {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	clone := &VoteState{
+		TargetHash: vs.TargetHash,
+		Score: &PNCounter{
+			Positive: make(map[models.NodeID]int),
+			Negative: make(map[models.NodeID]int),
+		},
+		UserVotes: make(map[models.UserID]*LWWRegister),
+	}
+
+	for k, v := range vs.Score.Positive {
+		clone.Score.Positive[k] = v
+	}
+	for k, v := range vs.Score.Negative {
+		clone.Score.Negative[k] = v
+	}
+
+	for userID, reg := range vs.UserVotes {
+		clone.UserVotes[userID] = &LWWRegister{
+			Value:     reg.Value,
+			Timestamp: reg.Timestamp,
+			NodeID:    reg.NodeID,
+		}
+	}
+
+	return clone
+}

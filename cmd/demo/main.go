@@ -11,6 +11,7 @@ import (
 	"github.com/Shan-Vision05/Distributed-Reddit/internal/consensus"
 	"github.com/Shan-Vision05/Distributed-Reddit/internal/crdt"
 	"github.com/Shan-Vision05/Distributed-Reddit/internal/models"
+	"github.com/Shan-Vision05/Distributed-Reddit/internal/network"
 	"github.com/Shan-Vision05/Distributed-Reddit/internal/storage"
 )
 
@@ -21,6 +22,7 @@ func main() {
 	demoStorage()
 	demoCRDTs()
 	demoRaft()
+	demoNetwork()
 
 	fmt.Println()
 	fmt.Println("  All demos completed successfully!")
@@ -348,6 +350,103 @@ func demoRaft() {
 				i+1, entry.LogIndex, entry.ActionType, target(entry), entry.Reason)
 		}
 	}
+
+	fmt.Println()
+}
+
+func demoNetwork() {
+	section("4. Gossip Network — Peer Discovery & CRDT Sync")
+	fmt.Println()
+
+	// Create three nodes with their own content stores
+	store1, _ := storage.NewContentStore("")
+	store2, _ := storage.NewContentStore("")
+	store3, _ := storage.NewContentStore("")
+
+	node1, err := network.NewGossipNode(network.GossipConfig{
+		NodeID:   "gossip-node-1",
+		BindAddr: "127.0.0.1",
+		BindPort: 18001,
+	}, store1)
+	check(err, "create gossip node 1")
+	defer node1.Shutdown()
+
+	node2, err := network.NewGossipNode(network.GossipConfig{
+		NodeID:   "gossip-node-2",
+		BindAddr: "127.0.0.1",
+		BindPort: 18002,
+	}, store2)
+	check(err, "create gossip node 2")
+	defer node2.Shutdown()
+
+	node3, err := network.NewGossipNode(network.GossipConfig{
+		NodeID:   "gossip-node-3",
+		BindAddr: "127.0.0.1",
+		BindPort: 18003,
+	}, store3)
+	check(err, "create gossip node 3")
+	defer node3.Shutdown()
+
+	// Form cluster
+	_, err = node2.Join([]string{"127.0.0.1:18001"})
+	check(err, "node2 join")
+	_, err = node3.Join([]string{"127.0.0.1:18001"})
+	check(err, "node3 join")
+	time.Sleep(100 * time.Millisecond)
+
+	info("Cluster", "%d nodes connected via gossip", node1.NumMembers())
+
+	// Create post on node1 and broadcast
+	post := &models.Post{
+		CommunityID: "distributed-systems",
+		AuthorID:    "distributed-dev",
+		Title:       "Hello from Node 1!",
+		Body:        "This post will replicate to all nodes via gossip protocol.",
+		CreatedAt:   time.Now(),
+	}
+	hash, _ := store1.StorePost(post)
+	err = node1.BroadcastPost(post)
+	check(err, "broadcast post")
+
+	info("Node 1", "created and broadcast post %s", truncHash(hash))
+
+	// Wait for propagation
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify all nodes received the post
+	posts1 := store1.GetAllPosts()
+	posts2 := store2.GetAllPosts()
+	posts3 := store3.GetAllPosts()
+
+	info("Node 1 posts", "%d", len(posts1))
+	info("Node 2 posts", "%d (received via gossip)", len(posts2))
+	info("Node 3 posts", "%d (received via gossip)", len(posts3))
+
+	// Demonstrate vote state CRDT sync
+	subsection("Vote State Sync via CRDT")
+
+	// Vote on post from different nodes
+	vote1 := models.Vote{TargetHash: hash, UserID: "user-at-node1", Value: models.Upvote, Timestamp: time.Now()}
+	store1.ApplyVote(vote1, "gossip-node-1")
+
+	vote2 := models.Vote{TargetHash: hash, UserID: "user-at-node2", Value: models.Upvote, Timestamp: time.Now()}
+	store2.StorePost(post) // Ensure post exists on node2 for voting
+	store2.ApplyVote(vote2, "gossip-node-2")
+
+	// Broadcast vote states
+	vs1 := store1.GetVoteState(hash)
+	vs2 := store2.GetVoteState(hash)
+	node1.BroadcastVoteState(vs1)
+	node2.BroadcastVoteState(vs2)
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Check scores after CRDT merge
+	score1, _ := store1.GetVoteScore(hash)
+	score2, _ := store2.GetVoteScore(hash)
+
+	info("Node 1 score", "%d (after CRDT merge)", score1)
+	info("Node 2 score", "%d (after CRDT merge)", score2)
 
 	fmt.Println()
 }

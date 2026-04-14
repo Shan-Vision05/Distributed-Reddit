@@ -215,3 +215,87 @@ func (cs *ContentStore) LoadFromDisk() error {
 
 	return nil
 }
+
+// HasPost checks if a post exists by hash.
+func (cs *ContentStore) HasPost(hash models.ContentHash) bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	_, ok := cs.posts[hash]
+	return ok
+}
+
+// HasComment checks if a comment exists by hash.
+func (cs *ContentStore) HasComment(hash models.ContentHash) bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	_, ok := cs.comments[hash]
+	return ok
+}
+
+// GetAllPosts returns all posts in the store.
+func (cs *ContentStore) GetAllPosts() []*models.Post {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	posts := make([]*models.Post, 0, len(cs.posts))
+	for _, post := range cs.posts {
+		posts = append(posts, post)
+	}
+	return posts
+}
+
+// GetAllComments returns all comments in the store.
+func (cs *ContentStore) GetAllComments() []*models.Comment {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	comments := make([]*models.Comment, 0, len(cs.comments))
+	for _, comment := range cs.comments {
+		comments = append(comments, comment)
+	}
+	return comments
+}
+
+// GetVoteState returns a clone of the VoteState for a given content hash.
+func (cs *ContentStore) GetVoteState(hash models.ContentHash) *crdt.VoteState {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	vs, ok := cs.votes[hash]
+	if !ok {
+		return nil
+	}
+	return vs.Clone()
+}
+
+// MergeVoteState merges an incoming VoteState with the local one.
+func (cs *ContentStore) MergeVoteState(incoming *crdt.VoteState) error {
+	if incoming == nil {
+		return nil
+	}
+
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	local, ok := cs.votes[incoming.TargetHash]
+	if !ok {
+		// If we don't have this content yet, store the incoming state
+		cs.votes[incoming.TargetHash] = incoming.Clone()
+		return nil
+	}
+
+	local.Merge(incoming)
+	return nil
+}
+
+// GetAllVoteStates returns clones of all VoteStates.
+func (cs *ContentStore) GetAllVoteStates() []*crdt.VoteState {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	states := make([]*crdt.VoteState, 0, len(cs.votes))
+	for _, vs := range cs.votes {
+		states = append(states, vs.Clone())
+	}
+	return states
+}

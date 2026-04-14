@@ -55,17 +55,26 @@ Wraps [HashiCorp Raft](https://github.com/hashicorp/raft) for moderation log rep
 - Snapshot/restore support for log compaction
 - Both TCP transport (production) and in-memory transport (testing)
 
+### Gossip Network (`internal/network`)
+HashiCorp memberlist-based gossip protocol for peer discovery and CRDT state synchronization:
+- `GossipNode` — manages cluster membership and message broadcasting
+- Peer discovery via SWIM protocol — nodes automatically discover each other
+- Post/comment broadcasting — new content replicates to all peers
+- VoteState sync — CRDT-based vote states merge across nodes without conflicts
+- State sync requests — new nodes can request full state from existing peers
+- Event callbacks — hooks for peer join/leave events
+
 ### Demo (`cmd/demo`)
 A runnable program that exercises everything end-to-end:
 - Creates posts and comments across multiple communities
 - Demonstrates CRDT merge behavior (counters, sets, voting)
 - Spins up a 3-node Raft cluster, elects a leader, proposes moderation actions, and shows all nodes have the identical log
+- Forms a 3-node gossip cluster, broadcasts posts, and shows CRDT vote sync
 
 ## What's pending
 
 | Step | Package | Description |
 |------|---------|-------------|
-| 5 | `internal/network` | Gossip protocol for peer discovery and CRDT state sync between nodes (probably using HashiCorp memberlist) |
 | 6 | `internal/dht` | Distributed hash table: maps communities to responsible nodes |
 | 7 | `internal/community` | Community manager: ties storage + CRDTs + Raft together per community |
 | 8 | `internal/node` | Node orchestrator: manages all communities on a single node, handles joins/leaves |
@@ -73,7 +82,7 @@ A runnable program that exercises everything end-to-end:
 | 10 | `cmd/dreddit` | CLI + main binary |
 | 11 | `ui/` | Web UI — browse communities, create posts, vote, and manage moderation from a browser |
 
-Right now everything runs inside a single process (the demo). Steps 5-6 add real networking to make it actually distributed. Steps 7-8 wire everything together. Steps 9-10 give it a usable interface. Step 11 adds a proper web frontend on top of the HTTP API.
+Steps 6 adds DHT for community-to-node mapping. Steps 7-8 wire everything together. Steps 9-10 give it a usable interface. Step 11 adds a proper web frontend on top of the HTTP API.
 
 ## Running
 
@@ -85,7 +94,7 @@ go run ./cmd/demo/ 2>/dev/null
 go build ./...
 ```
 
-The `2>/dev/null` suppresses HashiCorp Raft's internal debug logs.
+The `2>/dev/null` suppresses HashiCorp Raft and memberlist internal debug logs.
 
 ## Project Structure
 
@@ -101,9 +110,12 @@ Distributed-Reddit/
 │   │   └── crdt.go              # CRDT implementations
 │   ├── storage/
 │   │   └── content_store.go     # content-addressed storage
-│   └── consensus/
-│       ├── fsm.go               # Raft finite state machine
-│       └── raft.go              # HashiCorp Raft wrapper
+│   ├── consensus/
+│   │   ├── fsm.go               # Raft finite state machine
+│   │   └── raft.go              # HashiCorp Raft wrapper
+│   └── network/
+│       ├── gossip.go            # Gossip protocol implementation
+│       └── gossip_test.go       # 14 tests
 ├── go.mod
 ├── go.sum
 └── LICENSE
@@ -112,6 +124,7 @@ Distributed-Reddit/
 ## Tech Stack
 - **Go** — all backend code
 - **HashiCorp Raft** — consensus protocol for moderation
+- **HashiCorp memberlist** — gossip protocol for peer discovery and CRDT sync
 - **SHA-256** — content-addressed hashing
 - **JSON** — serialization and disk persistence
 - **Web UI** — frontend (TBD)
