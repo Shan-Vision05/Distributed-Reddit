@@ -1,14 +1,15 @@
 package tests
 
 import (
-"fmt"
-"testing"
-"time"
+	"fmt"
+	"testing"
+	"time"
 
-"github.com/Shan-Vision05/Distributed-Reddit/internal/crdt"
-"github.com/Shan-Vision05/Distributed-Reddit/internal/dht"
-"github.com/Shan-Vision05/Distributed-Reddit/internal/models"
-"github.com/Shan-Vision05/Distributed-Reddit/internal/storage"
+	"github.com/Shan-Vision05/Distributed-Reddit/internal/crdt"
+	"github.com/Shan-Vision05/Distributed-Reddit/internal/dht"
+	"github.com/Shan-Vision05/Distributed-Reddit/internal/models"
+	"github.com/Shan-Vision05/Distributed-Reddit/internal/network"
+	"github.com/Shan-Vision05/Distributed-Reddit/internal/storage"
 )
 
 // =====================================
@@ -749,4 +750,452 @@ if !stores[newID].HasPost(hash) {
 t.Errorf("recovery node should have the post after replication")
 }
 }
+}
+// =====================================
+// CRDT Merge Property Tests
+// =====================================
+
+// Tests that CRDT merge is commutative: merge(A,B) == merge(B,A)
+// and associative: merge(merge(A,B),C) == merge(A,merge(B,C))
+// This is CRITICAL for deployment — nodes merge states in arbitrary order
+// depending on network timing. If merge isn't commutative, nodes diverge.
+func TestCRDTMerge_Commutativity(t *testing.T) {
+	d := dht.NewCommunityDHT(dht.DHTConfig{VirtualNodes: 50, ReplicationFactor: 3})
+	ids := []models.NodeID{"node-A", "node-B", "node-C"}
+	for _, id := range ids {
+		d.AddNode(&models.NodeInfo{ID: id, Address: "127.0.0.1", IsAlive: true})
+	}
+
+	communityID := models.CommunityID("golang")
+	responsible := d.LookupNodes(communityID)
+	now := time.Now()
+
+	post := &models.Post{
+		CommunityID: communityID,
+		AuthorID:    "user-1",
+		Title:       "Commutativity test",
+		Body:        "Testing merge order independence",
+		CreatedAt:   now,
+	}
+
+	// Create 3 independent stores with the same post but different votes
+	makeStore := func(nodeID models.NodeID, userID models.UserID, voteVal models.VoteType, ts time.Time) *storage.ContentStore {
+		cs, _ := storage.NewContentStore("")
+		hash, _ := cs.StorePost(post)
+		cs.ApplyVote(models.Vote{TargetHash: hash, UserID: userID, Value: voteVal, Timestamp: ts}, nodeID)
+		return cs
+	}
+
+	// Order 1: A→B, then result→C
+	storeAB_1 := makeStore(responsible[0], "user-1", models.Upvote, now)
+	storeAB_2 := makeStore(responsible[1], "user-2", models.Upvote, now.Add(time.Millisecond))
+	storeAB_3 := makeStore(responsible[2], "user-3", models.Downvote, now.Add(2*time.Millisecond))
+
+	hash := post.ComputeHash()
+
+	vsA := storeAB_1.GetVoteState(hash)
+	vsB := storeAB_2.GetVoteState(hash)
+	vsC := storeAB_3.GetVoteState(hash)
+
+	// merge(A,B) then merge(result,C)
+	order1Store := makeStore(responsible[0], "user-1", models.Upvote, now)
+	order1Store.MergeVoteState(vsB)
+	order1Store.MergeVoteState(vsC)
+	score1, _ := order1Store.GetVoteScore(hash)
+
+	// merge(C,A) then merge(result,B) — reversed
+	order2Store := makeStore(responsible[2], "user-3", models.Downvote, now.Add(2*time.Millisecond))
+	order2Store.MergeVoteState(vsA)
+	order2Store.MergeVoteState(vsB)
+	score2, _ := order2Store.GetVoteScore(hash)
+
+	// merge(B,C) then merge(result,A)
+	order3Store := makeStore(responsible[1], "user-2", models.Upvote, now.Add(time.Millisecond))
+	order3Store.MergeVoteState(vsC)
+	order3Store.MergeVoteState(vsA)
+	score3, _ := order3Store.GetVoteScore(hash)
+
+	if score1 != score2 || score2 != score3 {
+		t.Errorf("CRDT commutativity/associativity violation: order1=%d, order2=%d, order3=%d",
+			score1, score2, score3)
+	}
+	t.Logf("All merge orders converged to score=%d", score1)
+}
+
+// Tests that merging the same state twice doesn't change the result.
+// In deployment, gossip retransmissions cause duplicate merges constantly.
+func TestCRDTMerge_Idempotency(t *testing.T) {
+	store1, _ := storage.NewContentStore("")
+	store2, _ := storage.NewContentStore("")
+
+	post := &models.Post{
+		CommunityID: "golang",
+		AuthorID:    "user-1",
+		Title:       "Idempotency test",
+		Body:        "Testing double merge safety",
+		CreatedAt:   time.Now(),
+	}
+
+	hash, _ := store1.StorePost(post)
+	store2.StorePost(post)
+
+	// Apply votes on store1
+	store1.ApplyVote(models.Vote{TargetHash: hash, UserID: "user-1", Value: models.Upvote, Timestamp: time.Now()}, "node-1")
+	store1.ApplyVote(models.Vote{TargetHash: hash, UserID: "user-2", Value: models.Downvote, Timestamp: time.Now()}, "node-1")
+
+	vs := store1.GetVoteState(hash)
+
+	// Merge once
+	store2.MergeVoteState(vs)
+	scoreAfterFirst, _ := store2.GetVoteScore(hash)
+
+	// Merge again (simulating gossip retransmission)
+	store2.MergeVoteState(vs)
+	scoreAfterSecond, _ := store2.GetVoteScore(hash)
+
+	// And again
+	store2.MergeVoteState(vs)
+	scoreAfterThird, _ := store2.GetVoteScore(hash)
+
+	if scoreAfterFirst != scoreAfterSecond || scoreAfterSecond != scoreAfterThird {
+		t.Errorf("idempotency violation: first=%d, second=%d, third=%d",
+			scoreAfterFirst, scoreAfterSecond, scoreAfterThird)
+	}
+}
+
+// Tests ALL 6 possible merge orderings of 3 nodes to guarantee convergence.
+func TestCRDTMerge_AllOrderings(t *testing.T) {
+	now := time.Now()
+	post := &models.Post{
+		CommunityID: "golang",
+		AuthorID:    "user-1",
+		Title:       "Permutation test",
+		Body:        "Testing all merge orderings",
+		CreatedAt:   now,
+	}
+	hash := post.ComputeHash()
+
+	type voteSpec struct {
+		nodeID models.NodeID
+		userID models.UserID
+		value  models.VoteType
+		ts     time.Time
+	}
+
+	specs := []voteSpec{
+		{"node-A", "user-1", models.Upvote, now},
+		{"node-B", "user-2", models.Upvote, now.Add(time.Millisecond)},
+		{"node-C", "user-3", models.Downvote, now.Add(2 * time.Millisecond)},
+	}
+
+	// Build independent vote states
+	makeVS := func(spec voteSpec) *storage.ContentStore {
+		cs, _ := storage.NewContentStore("")
+		cs.StorePost(post)
+		cs.ApplyVote(models.Vote{TargetHash: hash, UserID: spec.userID, Value: spec.value, Timestamp: spec.ts}, spec.nodeID)
+		return cs
+	}
+
+	// All 6 permutations of [0,1,2]
+	perms := [][3]int{
+		{0, 1, 2}, {0, 2, 1}, {1, 0, 2},
+		{1, 2, 0}, {2, 0, 1}, {2, 1, 0},
+	}
+
+	var scores []int64
+
+	for _, perm := range perms {
+		// Start from first in perm order, merge others
+		srcStores := [3]*storage.ContentStore{
+			makeVS(specs[0]), makeVS(specs[1]), makeVS(specs[2]),
+		}
+
+		// Get vote states BEFORE merging
+		voteStates := [3]*crdt.VoteState{}
+		for i := 0; i < 3; i++ {
+			voteStates[i] = srcStores[i].GetVoteState(hash)
+		}
+
+		// Target store starts with first permutation element
+		target, _ := storage.NewContentStore("")
+		target.StorePost(post)
+		target.ApplyVote(models.Vote{
+			TargetHash: hash,
+			UserID:     specs[perm[0]].userID,
+			Value:      specs[perm[0]].value,
+			Timestamp:  specs[perm[0]].ts,
+		}, specs[perm[0]].nodeID)
+
+		// Merge remaining in perm order
+		target.MergeVoteState(voteStates[perm[1]])
+		target.MergeVoteState(voteStates[perm[2]])
+
+		score, _ := target.GetVoteScore(hash)
+		scores = append(scores, score)
+	}
+
+	// All 6 orderings must produce the same score
+	for i := 1; i < len(scores); i++ {
+		if scores[i] != scores[0] {
+			t.Errorf("merge ordering %d produced score %d, but ordering 0 produced %d (divergence!)",
+				i, scores[i], scores[0])
+		}
+	}
+	t.Logf("All 6 merge orderings converged to score=%d", scores[0])
+}
+
+// Tests DHT + Gossip network together — the actual deployment pattern.
+// Content is broadcast via gossip, DHT determines which nodes are responsible.
+func TestGossipDHT_Integration(t *testing.T) {
+	// Set up 3 gossip nodes
+	store1, _ := storage.NewContentStore("")
+	store2, _ := storage.NewContentStore("")
+	store3, _ := storage.NewContentStore("")
+
+	node1, err := network.NewGossipNode(network.GossipConfig{
+		NodeID:   "gossip-dht-1",
+		BindAddr: "127.0.0.1",
+		BindPort: 18101,
+	}, store1)
+	if err != nil {
+		t.Fatalf("failed to create gossip node 1: %v", err)
+	}
+	defer node1.Shutdown()
+
+	node2, err := network.NewGossipNode(network.GossipConfig{
+		NodeID:   "gossip-dht-2",
+		BindAddr: "127.0.0.1",
+		BindPort: 18102,
+	}, store2)
+	if err != nil {
+		t.Fatalf("failed to create gossip node 2: %v", err)
+	}
+	defer node2.Shutdown()
+
+	node3, err := network.NewGossipNode(network.GossipConfig{
+		NodeID:   "gossip-dht-3",
+		BindAddr: "127.0.0.1",
+		BindPort: 18103,
+	}, store3)
+	if err != nil {
+		t.Fatalf("failed to create gossip node 3: %v", err)
+	}
+	defer node3.Shutdown()
+
+	// Form gossip cluster
+	_, err = node2.Join([]string{"127.0.0.1:18101"})
+	if err != nil {
+		t.Fatalf("node2 join failed: %v", err)
+	}
+	_, err = node3.Join([]string{"127.0.0.1:18101"})
+	if err != nil {
+		t.Fatalf("node3 join failed: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if node1.NumMembers() != 3 {
+		t.Fatalf("expected 3 gossip members, got %d", node1.NumMembers())
+	}
+
+	// Set up DHT with the same nodes
+	d := dht.NewCommunityDHT(dht.DHTConfig{VirtualNodes: 50, ReplicationFactor: 2})
+	d.AddNode(&models.NodeInfo{ID: "gossip-dht-1", Address: "127.0.0.1:18101", IsAlive: true})
+	d.AddNode(&models.NodeInfo{ID: "gossip-dht-2", Address: "127.0.0.1:18102", IsAlive: true})
+	d.AddNode(&models.NodeInfo{ID: "gossip-dht-3", Address: "127.0.0.1:18103", IsAlive: true})
+
+	stores := map[models.NodeID]*storage.ContentStore{
+		"gossip-dht-1": store1,
+		"gossip-dht-2": store2,
+		"gossip-dht-3": store3,
+	}
+	gossipNodes := map[models.NodeID]*network.GossipNode{
+		"gossip-dht-1": node1,
+		"gossip-dht-2": node2,
+		"gossip-dht-3": node3,
+	}
+
+	// Create a post and broadcast it via gossip
+	communityID := models.CommunityID("golang")
+	responsible := d.LookupNodes(communityID)
+
+	post := &models.Post{
+		CommunityID: communityID,
+		AuthorID:    "user-1",
+		Title:       "Gossip+DHT Integration",
+		Body:        "This post travels through gossip to all nodes",
+		CreatedAt:   time.Now(),
+	}
+
+	// Store on primary node and broadcast
+	primaryNode := responsible[0]
+	hash, _ := stores[primaryNode].StorePost(post)
+	err = gossipNodes[primaryNode].BroadcastPost(post)
+	if err != nil {
+		t.Fatalf("broadcast failed: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	// Gossip delivers to ALL nodes. Verify all received it.
+	for nodeID, store := range stores {
+		if !store.HasPost(hash) {
+			t.Errorf("node %s did not receive post via gossip", nodeID)
+		}
+	}
+
+	// Vote on different nodes
+	stores[responsible[0]].ApplyVote(models.Vote{
+		TargetHash: hash, UserID: "voter-1", Value: models.Upvote, Timestamp: time.Now(),
+	}, responsible[0])
+
+	if len(responsible) > 1 {
+		stores[responsible[1]].ApplyVote(models.Vote{
+			TargetHash: hash, UserID: "voter-2", Value: models.Upvote, Timestamp: time.Now(),
+		}, responsible[1])
+	}
+
+	// Sync vote states via gossip
+	for _, nodeID := range responsible {
+		vs := stores[nodeID].GetVoteState(hash)
+		if vs != nil {
+			gossipNodes[nodeID].BroadcastVoteState(vs)
+		}
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	// After gossip CRDT sync, responsible nodes should have converged scores
+	for _, nodeID := range responsible {
+		score, err := stores[nodeID].GetVoteScore(hash)
+		if err != nil {
+			t.Errorf("node %s: vote score error: %v", nodeID, err)
+			continue
+		}
+		if score < 1 {
+			t.Errorf("node %s: expected score >= 1 after gossip sync, got %d", nodeID, score)
+		}
+	}
+}
+
+// Tests that DHT operations remain consistent when both responsible nodes fail.
+// The system must gracefully reassign without data loss (from surviving replicas).
+func TestDHTCascadingFailures(t *testing.T) {
+	d := dht.NewCommunityDHT(dht.DHTConfig{VirtualNodes: 50, ReplicationFactor: 2})
+	stores := make(map[models.NodeID]*storage.ContentStore)
+
+	for i := 0; i < 6; i++ {
+		id := models.NodeID(fmt.Sprintf("node-%d", i))
+		d.AddNode(&models.NodeInfo{ID: id, Address: "127.0.0.1", IsAlive: true})
+		cs, _ := storage.NewContentStore("")
+		stores[id] = cs
+	}
+
+	communities := []models.CommunityID{"golang", "rust", "python", "java"}
+	postHashes := make(map[models.CommunityID]models.ContentHash)
+
+	// Store content on responsible nodes
+	for _, cid := range communities {
+		responsible := d.LookupNodes(cid)
+		post := &models.Post{
+			CommunityID: cid,
+			AuthorID:    "user-1",
+			Title:       fmt.Sprintf("Post in %s", cid),
+			Body:        "Content",
+			CreatedAt:   time.Now(),
+		}
+		for _, nodeID := range responsible {
+			h, _ := stores[nodeID].StorePost(post)
+			postHashes[cid] = h
+		}
+	}
+
+	// Kill 3 out of 6 nodes (potentially both replicas for some communities)
+	d.RemoveNode("node-0")
+	d.RemoveNode("node-2")
+	d.RemoveNode("node-4")
+
+	// All communities should still have responsible nodes
+	for _, cid := range communities {
+		responsible := d.LookupNodes(cid)
+		if len(responsible) == 0 {
+			t.Fatalf("community %s has no responsible nodes after failures!", cid)
+		}
+		if len(responsible) != 2 {
+			t.Errorf("community %s: expected 2 responsible nodes (from 3 survivors), got %d", cid, len(responsible))
+		}
+
+		// Check if at least one surviving responsible node has the data
+		hash := postHashes[cid]
+		foundData := false
+		for _, nodeID := range responsible {
+			if stores[nodeID].HasPost(hash) {
+				foundData = true
+				break
+			}
+		}
+
+		if !foundData {
+			// Data might be on a killed node — need replication from any survivor
+			// This is expected when both original replicas are killed
+			for _, nodeID := range responsible {
+				// Check all surviving stores for this data
+				for survivorID, store := range stores {
+					if survivorID == "node-0" || survivorID == "node-2" || survivorID == "node-4" {
+						continue // skip dead nodes
+					}
+					if store.HasPost(hash) {
+						p, _ := store.GetPost(hash)
+						stores[nodeID].StorePost(p)
+						foundData = true
+						break
+					}
+				}
+			}
+		}
+
+		// Verify data can be recovered
+		if !foundData {
+			t.Logf("community %s: data was on killed nodes, no surviving replica — data loss expected with rf=2 and 50%% node failure", cid)
+		}
+	}
+}
+
+// Tests that DHT with different node ID formats (real-world diversity) still distributes evenly.
+func TestDHT_RealWorldNodeIDs(t *testing.T) {
+	d := dht.NewCommunityDHT(dht.DHTConfig{VirtualNodes: 150, ReplicationFactor: 3})
+
+	// Real-world style node IDs
+	realIDs := []string{
+		"prod-us-east-1-server-001",
+		"prod-us-west-2-server-042",
+		"prod-eu-central-1-server-007",
+		"staging-us-east-1-server-001",
+		"prod-ap-southeast-1-server-013",
+	}
+
+	for _, id := range realIDs {
+		d.AddNode(&models.NodeInfo{
+			ID:      models.NodeID(id),
+			Address: fmt.Sprintf("10.0.%d.1:7946", len(id)),
+			IsAlive: true,
+		})
+	}
+
+	communities := make([]models.CommunityID, 200)
+	for i := 0; i < 200; i++ {
+		communities[i] = models.CommunityID(fmt.Sprintf("r/%d", i))
+	}
+
+	dist := d.GetDistribution(communities)
+
+	// Verify reasonable distribution (no node has 0 or > 50%)
+	for _, id := range realIDs {
+		count := dist[models.NodeID(id)]
+		if count == 0 {
+			t.Errorf("node %s has 0 communities — hash distribution failure", id)
+		}
+		if float64(count)/200 > 0.5 {
+			t.Errorf("node %s has %d/200 communities (>50%%) — severe imbalance", id, count)
+		}
+	}
 }

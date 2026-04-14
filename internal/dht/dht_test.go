@@ -773,3 +773,273 @@ if h1 == h3 {
 t.Error("different keys should produce different hashes (collision is astronomically unlikely)")
 }
 }
+// ===== Ring Wraparound =====
+// In a real deployment, ~50% of community hashes land past the last ring position.
+// sort.Search returns len(ring), and the modulo wraps to 0. This must work correctly.
+
+func TestLookupNodes_RingWraparound(t *testing.T) {
+	// Use 1 vnode per node so we can reason about ring positions
+	dht := makeDHT(1, 2)
+	dht.AddNode(makeNodeInfo("node-A"))
+	dht.AddNode(makeNodeInfo("node-B"))
+
+	// The ring has exactly 2 entries. Any community that hashes past the last
+	// entry must wrap around to position 0. Try many communities to guarantee
+	// at least some trigger the wraparound path.
+	for i := 0; i < 50; i++ {
+		community := models.CommunityID(fmt.Sprintf("wrap-test-%d", i))
+		nodes := dht.LookupNodes(community)
+		if len(nodes) != 2 {
+			t.Fatalf("community %s: expected 2 nodes, got %d", community, len(nodes))
+		}
+		// Both nodes should be present (with rf=2 and 2 nodes)
+		seen := map[models.NodeID]bool{nodes[0]: true, nodes[1]: true}
+		if !seen["node-A"] || !seen["node-B"] {
+			t.Errorf("community %s: expected both node-A and node-B, got %v", community, nodes)
+		}
+	}
+}
+
+func TestLookupNodes_RingWraparound_ExplicitVerification(t *testing.T) {
+	// Verify the wraparound by checking the actual binary search index
+	dht := makeDHT(1, 1)
+	dht.AddNode(makeNodeInfo("node-X"))
+
+	// With a single vnode, the ring has exactly 1 entry.
+	// For a community whose hash > ring[0], sort.Search returns 1 (past end),
+	// and (1 % 1) == 0 wraps back to the only entry.
+	// All communities must resolve to node-X regardless.
+	for i := 0; i < 100; i++ {
+		community := models.CommunityID(fmt.Sprintf("c-%d", i))
+		nodes := dht.LookupNodes(community)
+		if len(nodes) != 1 || nodes[0] != "node-X" {
+			t.Fatalf("community %s should map to node-X, got %v", community, nodes)
+		}
+	}
+}
+
+// ===== Cross-Instance Determinism =====
+// In deployment, EVERY node runs its own independent DHT instance.
+// Two instances with the same config and nodes MUST produce identical routing.
+
+func TestCrossInstance_Determinism(t *testing.T) {
+	// Create two independent DHT instances with the same config
+	dht1 := makeDHT(150, 3)
+	dht2 := makeDHT(150, 3)
+
+	// Add the same nodes (in the same order)
+	for i := 0; i < 5; i++ {
+		info := makeNodeInfo(fmt.Sprintf("node-%d", i))
+		dht1.AddNode(info)
+		dht2.AddNode(info)
+	}
+
+	// Both must produce identical results for all communities
+	for i := 0; i < 100; i++ {
+		community := models.CommunityID(fmt.Sprintf("community-%d", i))
+
+		nodes1 := dht1.LookupNodes(community)
+		nodes2 := dht2.LookupNodes(community)
+
+		if len(nodes1) != len(nodes2) {
+			t.Fatalf("community %s: instance1 returned %d nodes, instance2 returned %d",
+				community, len(nodes1), len(nodes2))
+		}
+
+		for j := range nodes1 {
+			if nodes1[j] != nodes2[j] {
+				t.Fatalf("community %s: divergence at position %d: %s vs %s",
+					community, j, nodes1[j], nodes2[j])
+			}
+		}
+	}
+}
+
+// ===== Node Add-Order Independence =====
+// Nodes may join the cluster in any order. The final routing MUST be identical.
+
+func TestAddNode_OrderIndependence(t *testing.T) {
+	nodeNames := []string{"node-alpha", "node-beta", "node-gamma", "node-delta", "node-epsilon"}
+
+	// Instance 1: add in forward order
+	dht1 := makeDHT(50, 3)
+	for _, name := range nodeNames {
+		dht1.AddNode(makeNodeInfo(name))
+	}
+
+	// Instance 2: add in reverse order
+	dht2 := makeDHT(50, 3)
+	for i := len(nodeNames) - 1; i >= 0; i-- {
+		dht2.AddNode(makeNodeInfo(nodeNames[i]))
+	}
+
+	// Instance 3: add in a scrambled order
+	dht3 := makeDHT(50, 3)
+	scrambled := []string{"node-gamma", "node-alpha", "node-epsilon", "node-delta", "node-beta"}
+	for _, name := range scrambled {
+		dht3.AddNode(makeNodeInfo(name))
+	}
+
+	// All three must produce identical routing
+	for i := 0; i < 100; i++ {
+		community := models.CommunityID(fmt.Sprintf("community-%d", i))
+		r1 := dht1.LookupNodes(community)
+		r2 := dht2.LookupNodes(community)
+		r3 := dht3.LookupNodes(community)
+
+		if len(r1) != len(r2) || len(r1) != len(r3) {
+			t.Fatalf("community %s: different result lengths across instances", community)
+		}
+
+		for j := range r1 {
+			if r1[j] != r2[j] || r1[j] != r3[j] {
+				t.Fatalf("community %s pos %d: forward=%s reverse=%s scrambled=%s",
+					community, j, r1[j], r2[j], r3[j])
+			}
+		}
+	}
+}
+
+// ===== LookupNodes Returns Defensive Copy =====
+
+func TestLookupNodes_ReturnsCopy_RingPath(t *testing.T) {
+	dht := makeDHT(50, 3)
+	for i := 0; i < 5; i++ {
+		dht.AddNode(makeNodeInfo(fmt.Sprintf("node-%d", i)))
+	}
+
+	result1 := dht.LookupNodes("golang")
+	original := make([]models.NodeID, len(result1))
+	copy(original, result1)
+
+	// Mutate the returned slice
+	result1[0] = "CORRUPTED"
+
+	// Subsequent lookup must be unaffected
+	result2 := dht.LookupNodes("golang")
+	for i := range original {
+		if result2[i] != original[i] {
+			t.Errorf("mutation of returned slice affected DHT: pos %d is %s, expected %s",
+				i, result2[i], original[i])
+		}
+	}
+}
+
+func TestLookupNodes_ReturnsCopy_AssignmentPath(t *testing.T) {
+	dht := makeDHT(10, 3)
+	dht.AddNode(makeNodeInfo("node-1"))
+	dht.AddNode(makeNodeInfo("node-2"))
+
+	dht.AssignCommunity("golang", []models.NodeID{"node-1", "node-2"})
+
+	result := dht.LookupNodes("golang")
+	result[0] = "CORRUPTED"
+
+	result2 := dht.LookupNodes("golang")
+	if result2[0] != "node-1" {
+		t.Error("mutation of returned assignment slice corrupted DHT state")
+	}
+}
+
+// ===== Empty Assignment Edge Case =====
+
+func TestAssignCommunity_EmptyList(t *testing.T) {
+	dht := makeDHT(50, 3)
+	for i := 0; i < 3; i++ {
+		dht.AddNode(makeNodeInfo(fmt.Sprintf("node-%d", i)))
+	}
+
+	// Assigning an empty list should either error or fall through to ring
+	err := dht.AssignCommunity("golang", []models.NodeID{})
+
+	// Regardless of whether it errors, lookup should still work
+	nodes := dht.LookupNodes("golang")
+	if len(nodes) == 0 {
+		t.Error("empty assignment should not break lookups — must fall back to ring")
+	}
+
+	// If no error, GetAssignment should return the empty list
+	// but LookupNodes must still work (fall back to ring)
+	if err == nil {
+		assigned, ok := dht.GetAssignment("golang")
+		if ok && len(assigned) == 0 {
+			// This is OK — empty assignment, ring fallback works
+			if len(nodes) != 3 {
+				t.Errorf("expected 3 ring nodes as fallback, got %d", len(nodes))
+			}
+		}
+	}
+}
+
+// ===== Reassign (Overwrite) =====
+
+func TestAssignCommunity_Reassign(t *testing.T) {
+	dht := makeDHT(10, 3)
+	dht.AddNode(makeNodeInfo("node-1"))
+	dht.AddNode(makeNodeInfo("node-2"))
+	dht.AddNode(makeNodeInfo("node-3"))
+
+	dht.AssignCommunity("golang", []models.NodeID{"node-1"})
+	nodes1 := dht.LookupNodes("golang")
+	if len(nodes1) != 1 || nodes1[0] != "node-1" {
+		t.Fatalf("first assignment failed: %v", nodes1)
+	}
+
+	// Overwrite with different assignment
+	dht.AssignCommunity("golang", []models.NodeID{"node-2", "node-3"})
+	nodes2 := dht.LookupNodes("golang")
+	if len(nodes2) != 2 {
+		t.Fatalf("reassignment should have 2 nodes, got %d", len(nodes2))
+	}
+	if nodes2[0] != "node-2" || nodes2[1] != "node-3" {
+		t.Errorf("expected [node-2, node-3], got %v", nodes2)
+	}
+}
+
+// ===== Cascading Failures Beyond Replication Factor =====
+
+func TestCascadingFailures(t *testing.T) {
+	dht := makeDHT(50, 2)
+	for i := 0; i < 5; i++ {
+		dht.AddNode(makeNodeInfo(fmt.Sprintf("node-%d", i)))
+	}
+
+	community := models.CommunityID("golang")
+
+	// Get original responsible nodes
+	original := dht.LookupNodes(community)
+	if len(original) != 2 {
+		t.Fatalf("expected 2 responsible nodes, got %d", len(original))
+	}
+
+	// Kill BOTH responsible nodes (exceeds replication factor)
+	dht.RemoveNode(original[0])
+	dht.RemoveNode(original[1])
+
+	// System should still work — the community gets remapped to remaining nodes
+	remaining := dht.LookupNodes(community)
+	if len(remaining) != 2 {
+		t.Errorf("after losing both replicas, should remap to 2 surviving nodes, got %d", len(remaining))
+	}
+
+	// Remaining nodes should be from the survivors
+	for _, n := range remaining {
+		if n == original[0] || n == original[1] {
+			t.Errorf("remapped to a dead node: %s", n)
+		}
+	}
+
+	// Kill ALL but one
+	for i := 0; i < 5; i++ {
+		id := models.NodeID(fmt.Sprintf("node-%d", i))
+		if id != remaining[0] {
+			dht.RemoveNode(id)
+		}
+	}
+
+	// Should still return the last surviving node
+	last := dht.LookupNodes(community)
+	if len(last) != 1 {
+		t.Errorf("with 1 node left, should return 1, got %d", len(last))
+	}
+}
