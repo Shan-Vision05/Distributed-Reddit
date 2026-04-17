@@ -57,7 +57,11 @@ func (cs *ContentStore) StorePost(post *models.Post) (models.ContentHash, error)
 
 	cs.posts[hash] = post
 	cs.communityPosts[post.CommunityID] = append(cs.communityPosts[post.CommunityID], hash)
-	cs.votes[hash] = crdt.NewVoteState(hash)
+	
+	if _, exists := cs.votes[hash]; !exists {
+		cs.votes[hash] = crdt.NewVoteState(hash)
+		cs.persistVoteState(cs.votes[hash])
+	}
 
 	cs.persistPost(post)
 	return hash, nil
@@ -93,7 +97,11 @@ func (cs *ContentStore) StoreComment(comment *models.Comment) (models.ContentHas
 
 	cs.comments[hash] = comment
 	cs.postComments[comment.PostHash] = append(cs.postComments[comment.PostHash], hash)
-	cs.votes[hash] = crdt.NewVoteState(hash)
+	
+	if _, exists := cs.votes[hash]; !exists {
+		cs.votes[hash] = crdt.NewVoteState(hash)
+		cs.persistVoteState(cs.votes[hash])
+	}
 
 	cs.persistComment(comment)
 	return hash, nil
@@ -130,6 +138,7 @@ func (cs *ContentStore) ApplyVote(vote models.Vote, nodeID models.NodeID) error 
 	}
 
 	vs.ApplyVote(vote, nodeID)
+	cs.persistVoteState(vs) // Save the new score to disk instantly
 	return nil
 }
 
@@ -143,6 +152,10 @@ func (cs *ContentStore) GetVoteScore(hash models.ContentHash) (int64, error) {
 	}
 	return vs.GetScore(), nil
 }
+
+// ---------------------------------------------------------
+// Persistence Methods
+// ---------------------------------------------------------
 
 func (cs *ContentStore) persistPost(post *models.Post) {
 	if cs.dataDir == "" {
@@ -172,7 +185,25 @@ func (cs *ContentStore) persistComment(comment *models.Comment) {
 	_ = os.WriteFile(filepath.Join(dir, string(comment.Hash)+".json"), data, 0644)
 }
 
+func (cs *ContentStore) persistVoteState(vs *crdt.VoteState) {
+	if cs.dataDir == "" || vs == nil {
+		return
+	}
+	dir := filepath.Join(cs.dataDir, "votes")
+	_ = os.MkdirAll(dir, 0755)
+
+	data, err := json.MarshalIndent(vs, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, string(vs.TargetHash)+".json"), data, 0644)
+}
+
 func (cs *ContentStore) LoadFromDisk() error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	// 1. Load Posts
 	postsDir := filepath.Join(cs.dataDir, "posts")
 	if entries, err := os.ReadDir(postsDir); err == nil {
 		for _, entry := range entries {
@@ -184,15 +215,17 @@ func (cs *ContentStore) LoadFromDisk() error {
 				continue
 			}
 			var post models.Post
-			if err := json.Unmarshal(data, &post); err != nil {
-				continue
+			if err := json.Unmarshal(data, &post); err == nil {
+				cs.posts[post.Hash] = &post
+				cs.communityPosts[post.CommunityID] = append(cs.communityPosts[post.CommunityID], post.Hash)
+				if _, exists := cs.votes[post.Hash]; !exists {
+					cs.votes[post.Hash] = crdt.NewVoteState(post.Hash)
+				}
 			}
-			cs.posts[post.Hash] = &post
-			cs.communityPosts[post.CommunityID] = append(cs.communityPosts[post.CommunityID], post.Hash)
-			cs.votes[post.Hash] = crdt.NewVoteState(post.Hash)
 		}
 	}
 
+	// 2. Load Comments
 	commentsDir := filepath.Join(cs.dataDir, "comments")
 	if entries, err := os.ReadDir(commentsDir); err == nil {
 		for _, entry := range entries {
@@ -204,19 +237,41 @@ func (cs *ContentStore) LoadFromDisk() error {
 				continue
 			}
 			var comment models.Comment
-			if err := json.Unmarshal(data, &comment); err != nil {
+			if err := json.Unmarshal(data, &comment); err == nil {
+				cs.comments[comment.Hash] = &comment
+				cs.postComments[comment.PostHash] = append(cs.postComments[comment.PostHash], comment.Hash)
+				if _, exists := cs.votes[comment.Hash]; !exists {
+					cs.votes[comment.Hash] = crdt.NewVoteState(comment.Hash)
+				}
+			}
+		}
+	}
+
+	// 3. Load Vote States (Overwrites the empty ones created above)
+	votesDir := filepath.Join(cs.dataDir, "votes")
+	if entries, err := os.ReadDir(votesDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
 				continue
 			}
-			cs.comments[comment.Hash] = &comment
-			cs.postComments[comment.PostHash] = append(cs.postComments[comment.PostHash], comment.Hash)
-			cs.votes[comment.Hash] = crdt.NewVoteState(comment.Hash)
+			data, err := os.ReadFile(filepath.Join(votesDir, entry.Name()))
+			if err != nil {
+				continue
+			}
+			var vs crdt.VoteState
+			if err := json.Unmarshal(data, &vs); err == nil {
+				cs.votes[vs.TargetHash] = &vs
+			}
 		}
 	}
 
 	return nil
 }
 
-// HasPost checks if a post exists by hash.
+// ---------------------------------------------------------
+// Helper / Utility Methods
+// ---------------------------------------------------------
+
 func (cs *ContentStore) HasPost(hash models.ContentHash) bool {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
@@ -224,7 +279,6 @@ func (cs *ContentStore) HasPost(hash models.ContentHash) bool {
 	return ok
 }
 
-// HasComment checks if a comment exists by hash.
 func (cs *ContentStore) HasComment(hash models.ContentHash) bool {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
@@ -232,7 +286,6 @@ func (cs *ContentStore) HasComment(hash models.ContentHash) bool {
 	return ok
 }
 
-// GetAllPosts returns all posts in the store.
 func (cs *ContentStore) GetAllPosts() []*models.Post {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
@@ -244,7 +297,6 @@ func (cs *ContentStore) GetAllPosts() []*models.Post {
 	return posts
 }
 
-// GetAllComments returns all comments in the store.
 func (cs *ContentStore) GetAllComments() []*models.Comment {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
@@ -256,7 +308,6 @@ func (cs *ContentStore) GetAllComments() []*models.Comment {
 	return comments
 }
 
-// GetVoteState returns a clone of the VoteState for a given content hash.
 func (cs *ContentStore) GetVoteState(hash models.ContentHash) *crdt.VoteState {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
@@ -268,7 +319,6 @@ func (cs *ContentStore) GetVoteState(hash models.ContentHash) *crdt.VoteState {
 	return vs.Clone()
 }
 
-// MergeVoteState merges an incoming VoteState with the local one.
 func (cs *ContentStore) MergeVoteState(incoming *crdt.VoteState) error {
 	if incoming == nil {
 		return nil
@@ -279,16 +329,16 @@ func (cs *ContentStore) MergeVoteState(incoming *crdt.VoteState) error {
 
 	local, ok := cs.votes[incoming.TargetHash]
 	if !ok {
-		// If we don't have this content yet, store the incoming state
 		cs.votes[incoming.TargetHash] = incoming.Clone()
+		cs.persistVoteState(cs.votes[incoming.TargetHash]) // Persist the merged data
 		return nil
 	}
 
 	local.Merge(incoming)
+	cs.persistVoteState(local) // Persist the updated data
 	return nil
 }
 
-// GetAllVoteStates returns clones of all VoteStates.
 func (cs *ContentStore) GetAllVoteStates() []*crdt.VoteState {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()

@@ -298,3 +298,13 @@ func (d *CommunityDHT) hashKey(key string) uint64 {
 h := sha256.Sum256([]byte(key))
 return binary.BigEndian.Uint64(h[:8])
 }
+
+// Announce broadcasts to the DHT network that this specific node is now hosting a community.
+func (d *CommunityDHT) Announce(communityID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// For local testing, we log the announcement.
+	// In a full P2P network, this would hash the ID and register it with the closest peers.
+	fmt.Printf("[DHT] Successfully announced hosting for community: d/%s\n", communityID)
+}

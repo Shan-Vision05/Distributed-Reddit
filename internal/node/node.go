@@ -3,6 +3,8 @@ package node
 import (
 	"fmt"
 	"math/rand"
+	"os"           // Add this
+	"strings"      // Add this
 	"sync"
 	"time"
 
@@ -31,7 +33,7 @@ func NewNode(nodeID models.NodeID, bindAddr string) (*Node, error) {
 	// 2. Initialize Gossip Network
 	store, _ := storage.NewContentStore("")
 	rand.Seed(time.Now().UnixNano())
-	gossipPort := 10000 + rand.Intn(10000) // Random port for gossip
+	gossipPort := 10000 + rand.Intn(10000)
 
 	gossipNode, err := network.NewGossipNode(network.GossipConfig{
 		NodeID:   nodeID,
@@ -42,12 +44,37 @@ func NewNode(nodeID models.NodeID, bindAddr string) (*Node, error) {
 		return nil, fmt.Errorf("failed to start gossip: %v", err)
 	}
 
-	return &Node{
+	n := &Node{
 		NodeID:      nodeID,
 		DHT:         dhtNode,
 		Gossip:      gossipNode,
 		communities: make(map[models.CommunityID]*community.Manager),
-	}, nil
+	}
+
+	// ---------------------------------------------------------
+	// NEW: AUTO-LOAD COMMUNITIES ON STARTUP
+	// ---------------------------------------------------------
+	// Scans the current directory for saved community folders/files 
+	// and automatically rejoins them so the frontend populates instantly.
+	files, err := os.ReadDir(".")
+	if err == nil {
+		for _, f := range files {
+			// Look for files or directories that match your community storage naming convention
+			// Make sure this prefix matches whatever you put in JoinCommunity!
+			prefix := fmt.Sprintf("data_%s_", nodeID) 
+			
+			if strings.HasPrefix(f.Name(), prefix) {
+				// Extract the community ID from the folder name
+				commID := strings.TrimPrefix(f.Name(), prefix)
+				commID = strings.TrimSuffix(commID, ".json") // Just in case it's a file
+				
+				// Re-join the community automatically
+				n.JoinCommunity(models.CommunityID(commID))
+			}
+		}
+	}
+
+	return n, nil
 }
 
 func (n *Node) JoinCommunity(communityID models.CommunityID) error {
@@ -58,12 +85,14 @@ func (n *Node) JoinCommunity(communityID models.CommunityID) error {
 		return fmt.Errorf("already a member of community %s", communityID)
 	}
 
-	store, _ := storage.NewContentStore("")
+	// NEW: Give this specific node and community a unique file name
+	fileName := fmt.Sprintf("data_%s_%s.json", n.NodeID, communityID)
+	store, _ := storage.NewContentStore(fileName)
 
 	raftCfg := consensus.RaftConfig{
 		NodeID:      n.NodeID,
 		CommunityID: communityID,
-		BindAddr:    fmt.Sprintf("127.0.0.1:%d", 20000+rand.Intn(10000)), // Random port for raft
+		BindAddr:    fmt.Sprintf("127.0.0.1:%d", 20000+rand.Intn(10000)),
 		Bootstrap:   true,
 	}
 	raftNode, err := consensus.NewRaftNode(raftCfg)
@@ -73,6 +102,8 @@ func (n *Node) JoinCommunity(communityID models.CommunityID) error {
 
 	manager := community.NewManager(communityID, n.NodeID, store, n.Gossip, raftNode)
 	n.communities[communityID] = manager
+	
+	n.DHT.Announce(string(communityID))
 
 	return nil
 }
