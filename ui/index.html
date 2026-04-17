@@ -10,7 +10,6 @@
         header { background: var(--surface); padding: 10px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100; }
         .logo { font-size: 1.5rem; font-weight: bold; color: var(--primary); display: flex; align-items: center; gap: 8px;}
         .container { display: grid; grid-template-columns: 1fr 300px; gap: 24px; max-width: 1000px; margin: 24px auto; padding: 0 16px; }
-        
         .post { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; display: flex; margin-bottom: 16px; transition: border 0.2s; cursor: pointer; }
         .post:hover { border-color: #898989; }
         .vote-col { background: #f8f9fa; padding: 8px; display: flex; flex-direction: column; align-items: center; width: 40px; border-radius: 4px 0 0 4px; border-right: 1px solid var(--border); }
@@ -22,26 +21,47 @@
         .meta b { color: var(--text-main); }
         .title { font-size: 1.1rem; font-weight: bold; margin: 0 0 8px 0; }
         .body { font-size: 0.9rem; line-height: 1.4; color: #333; }
-        
         .sidebar { background: var(--surface); padding: 16px; border: 1px solid var(--border); border-radius: 4px; height: fit-content; }
         .btn { background: var(--primary); color: white; border: none; padding: 10px; width: 100%; border-radius: 999px; font-weight: bold; cursor: pointer; margin-bottom: 16px; }
         .btn:hover { background: #e03d00; }
+        .btn-outline { background: white; color: var(--primary); border: 1px solid var(--primary); margin-bottom: 0;}
+        .btn-outline:hover { background: #f8f9fa; }
         input, textarea { width: 100%; padding: 8px; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 4px; box-sizing: border-box; }
         .community-list { list-style: none; padding: 0; margin: 0; }
         .community-list li { padding: 8px; cursor: pointer; border-radius: 4px; }
         .community-list li:hover, .community-list li.active { background: var(--bg); font-weight: bold; }
-
         .comments-section { padding-top: 16px; border-top: 1px solid var(--border); margin-top: 16px; display: none; }
         .comment { border-left: 2px solid var(--border); padding-left: 12px; margin-bottom: 12px; }
+        
+        /* Auth Modal */
+        #login-modal { display: none; flex-direction: column; align-items: center; justify-content: center; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.6); z-index: 1000; }
+        .login-box { background: white; padding: 40px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); width: 320px; text-align: center; }
     </style>
 </head>
 <body>
+    <div id="login-modal">
+        <div class="login-box">
+            <h2 id="auth-title">Log In</h2>
+            <p id="auth-desc" style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 24px;">Enter your credentials to access the network.</p>
+            
+            <input type="text" id="auth-username" placeholder="Username">
+            <input type="password" id="auth-password" placeholder="Password" onkeypress="if(event.key === 'Enter') submitAuth()">
+            
+            <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+                <button class="btn btn-outline" onclick="hideLogin()">Cancel</button>
+                <button class="btn" id="auth-action-btn" onclick="submitAuth()" style="margin-bottom: 0;">Log In</button>
+            </div>
+
+            <a href="#" style="font-size: 0.85rem; color: var(--primary); text-decoration: none;" onclick="toggleAuthMode()" id="auth-toggle">Don't have an account? Sign up</a>
+        </div>
+    </div>
+
     <header>
         <div class="logo">🌐 DReddit <span style="font-size: 1rem; color: #787c7e; font-weight: normal;">Decentralized Frontpage</span></div>
-        <div style="font-weight: bold;" id="active-user">User: AnonNodeUser</div>
+        <div id="auth-section" style="display: flex; align-items: center; gap: 12px; font-size: 0.9rem;"></div>
     </header>
 
-    <div class="container">
+    <div class="container" id="main-app">
         <main id="feed">
             <h2 id="feed-title">Select a community</h2>
             <div id="posts-container"></div>
@@ -66,13 +86,86 @@
 
     <script>
         const API = 'http://localhost:8080/api';
-        const USER_ID = "WebUser_" + Math.floor(Math.random() * 1000);
-        document.getElementById('active-user').innerText = `User: ${USER_ID}`;
-        
+        let USER_ID = localStorage.getItem('dreddit_user') || '';
         let activeCommunity = '';
-        let openComments = new Set(); // Tracks which comment sections are currently open
+        let openComments = new Set();
+        let pollingInterval = null;
+        let authMode = 'login'; // Can be 'login' or 'signup'
 
-        async function init() { await fetchCommunities(); }
+        // --- AUTHENTICATION LOGIC ---
+        function updateAuthUI() {
+            const authSec = document.getElementById('auth-section');
+            if (!USER_ID) {
+                authSec.innerHTML = `<button class="btn btn-outline" style="padding: 6px 16px; font-size: 0.85rem;" onclick="showLogin()">Log In</button>`;
+            } else {
+                authSec.innerHTML = `<b>${USER_ID}</b><button class="btn btn-outline" style="padding: 4px 12px; font-size: 0.8rem;" onclick="logout()">Logout</button>`;
+            }
+        }
+
+        function showLogin() { document.getElementById('login-modal').style.display = 'flex'; }
+        
+        function hideLogin() { 
+            document.getElementById('login-modal').style.display = 'none'; 
+            document.getElementById('auth-password').value = '';
+        }
+
+        function toggleAuthMode() {
+            authMode = authMode === 'login' ? 'signup' : 'login';
+            document.getElementById('auth-title').innerText = authMode === 'login' ? 'Log In' : 'Create Account';
+            document.getElementById('auth-desc').innerText = authMode === 'login' ? 'Enter your credentials to access the network.' : 'Sign up to post and comment.';
+            document.getElementById('auth-action-btn').innerText = authMode === 'login' ? 'Log In' : 'Sign Up';
+            document.getElementById('auth-toggle').innerText = authMode === 'login' ? "Don't have an account? Sign up" : "Already have an account? Log in";
+        }
+
+        async function submitAuth() {
+            const u = document.getElementById('auth-username').value.trim();
+            const p = document.getElementById('auth-password').value.trim();
+            if (!u || !p) return alert("Username and password are required.");
+
+            // FIX: Removed the extra /api from these paths
+            const endpoint = authMode === 'login' ? '/login' : '/signup';
+            
+            const res = await fetch(`${API}${endpoint}`, {
+                method: 'POST',
+                body: JSON.stringify({ username: u, password: p })
+            });
+
+            if (!res.ok) {
+                const errText = await res.text();
+                return alert(errText);
+            }
+
+            if (authMode === 'signup') {
+                alert("Account successfully created! You are now logged in.");
+            }
+
+            USER_ID = u;
+            localStorage.setItem('dreddit_user', USER_ID);
+            hideLogin();
+            updateAuthUI();
+        }
+
+        function logout() {
+            USER_ID = '';
+            localStorage.removeItem('dreddit_user');
+            updateAuthUI();
+        }
+
+        function requireAuth(event) {
+            if (event) event.stopPropagation();
+            if (!USER_ID) {
+                showLogin();
+                return false;
+            }
+            return true;
+        }
+
+        // --- CORE LOGIC ---
+        async function init() { 
+            updateAuthUI();
+            await fetchCommunities(); 
+            if (!pollingInterval) pollingInterval = setInterval(loadPosts, 5000);
+        }
 
         async function fetchCommunities() {
             const res = await fetch(`${API}/communities`);
@@ -92,9 +185,17 @@
         }
 
         async function joinCommunity() {
+            if (!requireAuth()) return;
             const id = document.getElementById('join-comm').value.trim();
             if(!id) return;
-            await fetch(`${API}/join`, { method: 'POST', body: JSON.stringify({ community_id: id }) });
+            
+            const res = await fetch(`${API}/join`, { 
+                method: 'POST', 
+                body: JSON.stringify({ community_id: id, user_id: USER_ID }) 
+            });
+            
+            if (!res.ok) return alert(await res.text());
+            
             document.getElementById('join-comm').value = '';
             await fetchCommunities();
             selectCommunity(id);
@@ -102,7 +203,7 @@
 
         function selectCommunity(id) {
             activeCommunity = id;
-            openComments.clear(); // Reset open comments when switching communities
+            openComments.clear(); 
             document.getElementById('feed-title').innerText = `d/${id}`;
             fetchCommunities(); 
             loadPosts();
@@ -111,11 +212,8 @@
         async function loadPosts() {
             if(!activeCommunity) return;
 
-            // Pause the 5-second auto-refresh if the user is actively typing in an input or textarea
             const activeTag = document.activeElement ? document.activeElement.tagName : '';
-            if (activeTag === 'INPUT' || activeTag === 'TEXTAREA') {
-                return;
-            }
+            if (activeTag === 'INPUT' || activeTag === 'TEXTAREA') return;
 
             const res = await fetch(`${API}/posts?community_id=${activeCommunity}`);
             const posts = await res.json() || [];
@@ -125,7 +223,6 @@
             container.innerHTML = '';
             
             for (const p of posts) {
-                // Determine if this specific post's comments were open
                 const isOp = openComments.has(p.hash);
                 const displayStyle = isOp ? 'block' : 'none';
 
@@ -143,7 +240,7 @@
                             
                             <div class="comments-section" id="comments-${p.hash}" style="display: ${displayStyle};">
                                 <div style="display: flex; gap: 8px; margin-bottom: 12px;">
-                                    <input type="text" id="reply-${p.hash}" placeholder="Add a comment..." style="margin: 0;" onclick="event.stopPropagation()">
+                                    <input type="text" id="reply-${p.hash}" placeholder="Add a comment..." style="margin: 0;" onclick="requireAuth(event)">
                                     <button class="btn" style="margin: 0; width: auto; padding: 0 16px;" onclick="submitComment('${p.hash}', event)">Reply</button>
                                 </div>
                                 <div id="comments-list-${p.hash}"></div>
@@ -152,15 +249,13 @@
                     </div>
                 `;
 
-                // If the comment section is open, fetch the comments silently so the UI doesn't collapse
-                if (isOp) {
-                    await fetchCommentsSilently(p.hash);
-                }
+                if (isOp) await fetchCommentsSilently(p.hash);
             }
         }
 
         async function vote(hash, value, event) {
-            event.stopPropagation();
+            if (!requireAuth(event)) return;
+
             await fetch(`${API}/vote`, {
                 method: 'POST',
                 body: JSON.stringify({
@@ -172,25 +267,28 @@
         }
 
         function togglePostForm() {
+            if (!requireAuth()) return;
             const form = document.getElementById('create-post-form');
             form.style.display = form.style.display === 'none' ? 'block' : 'none';
         }
 
         async function submitPost() {
-            if(!activeCommunity) return alert("Select a community first!");
+            if (!requireAuth()) return;
+            if (!activeCommunity) return alert("Select a community first!");
+            
             const post = {
                 community_id: activeCommunity, author_id: USER_ID,
                 title: document.getElementById('post-title').value,
                 body: document.getElementById('post-body').value
             };
             await fetch(`${API}/post`, { method: 'POST', body: JSON.stringify(post) });
+            
             document.getElementById('post-title').value = '';
             document.getElementById('post-body').value = '';
             togglePostForm();
             loadPosts();
         }
 
-        // Helper function to fetch and render comments without toggling the container's display property
         async function fetchCommentsSilently(postHash) {
             const res = await fetch(`${API}/comments?community_id=${activeCommunity}&post_hash=${postHash}`);
             const comments = await res.json() || [];
@@ -207,22 +305,19 @@
 
         async function toggleComments(postHash) {
             const sec = document.getElementById(`comments-${postHash}`);
-            
-            // If it's already open, close it
             if (openComments.has(postHash)) {
                 openComments.delete(postHash);
                 sec.style.display = 'none';
                 return;
             }
-            
-            // Otherwise, open it and fetch the comments
             openComments.add(postHash);
             sec.style.display = 'block';
             await fetchCommentsSilently(postHash);
         }
 
         async function submitComment(postHash, event) {
-            event.stopPropagation();
+            if (!requireAuth(event)) return;
+
             const body = document.getElementById(`reply-${postHash}`).value;
             if(!body) return;
             
@@ -234,14 +329,12 @@
                 })
             });
             
-            // Clear the input, ensure the section stays open, and silently refresh the comments
             document.getElementById(`reply-${postHash}`).value = '';
             openComments.add(postHash);
             await fetchCommentsSilently(postHash);
         }
 
         init();
-        setInterval(loadPosts, 5000); 
     </script>
 </body>
 </html>

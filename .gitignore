@@ -2,3 +2,4 @@ demo
 # Ignore local database and Raft consensus files
 data_*
 raft*
+users.json
