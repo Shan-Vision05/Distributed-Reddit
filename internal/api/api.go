@@ -213,7 +213,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/vote", s.handleVote)
 	mux.HandleFunc("/api/moderate", s.handleModerate)
 	mux.HandleFunc("/api/status", s.handleStatus)
-	return mux
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) Start(addr string) error {
