@@ -173,6 +173,39 @@ func (n *Node) raftDataDir(communityID models.CommunityID) string {
 	return name
 }
 
+func (n *Node) raftAddrFile(communityID models.CommunityID) string {
+	return filepath.Join(n.raftDataDir(communityID), "raft_addr")
+}
+
+func (n *Node) loadOrCreateRaftAddr(communityID models.CommunityID) (string, error) {
+	if addr, ok := n.raftAddrs[communityID]; ok && addr != "" {
+		return addr, nil
+	}
+
+	if n.dataDir != "" {
+		if data, err := os.ReadFile(n.raftAddrFile(communityID)); err == nil {
+			addr := strings.TrimSpace(string(data))
+			if addr != "" {
+				return addr, nil
+			}
+		}
+	}
+
+	addr := fmt.Sprintf("127.0.0.1:%d", 20000+rand.Intn(10000))
+	if n.dataDir == "" {
+		return addr, nil
+	}
+
+	if err := os.MkdirAll(n.raftDataDir(communityID), 0755); err != nil {
+		return "", fmt.Errorf("create raft data dir: %w", err)
+	}
+	if err := os.WriteFile(n.raftAddrFile(communityID), []byte(addr+"\n"), 0644); err != nil {
+		return "", fmt.Errorf("persist raft addr: %w", err)
+	}
+
+	return addr, nil
+}
+
 func (n *Node) JoinCommunity(communityID models.CommunityID) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -181,7 +214,10 @@ func (n *Node) JoinCommunity(communityID models.CommunityID) error {
 		return fmt.Errorf("already a member of community %s", communityID)
 	}
 
-	raftAddr := fmt.Sprintf("127.0.0.1:%d", 20000+rand.Intn(10000))
+	raftAddr, err := n.loadOrCreateRaftAddr(communityID)
+	if err != nil {
+		return fmt.Errorf("resolve raft addr: %v", err)
+	}
 	raftCfg := consensus.RaftConfig{
 		NodeID:      n.NodeID,
 		CommunityID: communityID,
@@ -241,7 +277,10 @@ func (n *Node) JoinCommunityAsFollower(communityID models.CommunityID) error {
 		return fmt.Errorf("already a member of community %s", communityID)
 	}
 
-	raftAddr := fmt.Sprintf("127.0.0.1:%d", 20000+rand.Intn(10000))
+	raftAddr, err := n.loadOrCreateRaftAddr(communityID)
+	if err != nil {
+		return fmt.Errorf("resolve raft addr: %v", err)
+	}
 	raftCfg := consensus.RaftConfig{
 		NodeID:      n.NodeID,
 		CommunityID: communityID,
