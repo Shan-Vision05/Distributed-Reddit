@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -16,7 +17,8 @@ import (
 type Server struct {
 	node     *node.Node
 	mu       sync.RWMutex
-	users    map[string]string // Maps username -> hashed password
+	users    map[string]string // username -> hashed password
+	tokens   map[string]string // session token -> username
 	authFile string
 }
 
@@ -24,6 +26,7 @@ func NewServer(n *node.Node) *Server {
 	s := &Server{
 		node:     n,
 		users:    make(map[string]string),
+		tokens:   make(map[string]string),
 		authFile: "users.json",
 	}
 	s.loadUsers()
@@ -49,6 +52,29 @@ func hashPassword(password string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// generateToken creates a cryptographically secure 32-byte hex token.
+func generateToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// validateToken reads the Authorization: Bearer <token> header and returns the
+// authenticated username. Returns ("", false) if the token is missing or invalid.
+func (s *Server) validateToken(r *http.Request) (string, bool) {
+	auth := r.Header.Get("Authorization")
+	if len(auth) < 8 || auth[:7] != "Bearer " {
+		return "", false
+	}
+	token := auth[7:]
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	username, ok := s.tokens[token]
+	return username, ok
+}
+
 func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -72,9 +98,19 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	token, err := generateToken()
+	if err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+
 	s.users[req.Username] = hashPassword(req.Password)
+	s.tokens[token] = req.Username
 	s.saveUsers()
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"token": token, "user_id": req.Username})
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -92,8 +128,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	expectedHash, exists := s.users[req.Username]
 	if !exists || expectedHash != hashPassword(req.Password) {
@@ -101,19 +137,27 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	token, err := generateToken()
+	if err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	s.tokens[token] = req.Username
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"token": token, "user_id": req.Username})
 }
 
 // --- Moderation Helpers ---
 
 func isBanned(logs []models.ModerationAction, userID string) bool {
 	banned := false
-	for _, log := range logs {
-		// Convert TargetHash and ActionType to standard strings for comparison
-		if string(log.TargetHash) == userID {
-			if string(log.ActionType) == "BAN_USER" {
+	for _, entry := range logs {
+		if string(entry.TargetUser) == userID {
+			if entry.ActionType == models.ModBanUser {
 				banned = true
-			} else if string(log.ActionType) == "UNBAN_USER" {
+			} else if entry.ActionType == models.ModUnbanUser {
 				banned = false
 			}
 		}
@@ -123,16 +167,13 @@ func isBanned(logs []models.ModerationAction, userID string) bool {
 
 // --- Main Server Setup ---
 
-func (s *Server) Start(addr string) error {
+// Handler builds and returns the HTTP request handler.
+// Exported so tests can use httptest.NewServer(server.Handler()).
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-
 	mux.Handle("/", http.FileServer(http.Dir("./ui")))
-
-	// Auth Endpoints
 	mux.HandleFunc("/api/signup", s.handleSignup)
 	mux.HandleFunc("/api/login", s.handleLogin)
-
-	// App Endpoints
 	mux.HandleFunc("/api/communities", s.handleGetCommunities)
 	mux.HandleFunc("/api/join", s.handleJoinCommunity)
 	mux.HandleFunc("/api/posts", s.handleGetPosts)
@@ -141,8 +182,41 @@ func (s *Server) Start(addr string) error {
 	mux.HandleFunc("/api/comment", s.handleCreateComment)
 	mux.HandleFunc("/api/vote", s.handleVote)
 	mux.HandleFunc("/api/moderate", s.handleModerate)
+	mux.HandleFunc("/api/status", s.handleStatus)
+	return mux
+}
 
-	return http.ListenAndServe(addr, mux)
+func (s *Server) Start(addr string) error {
+	return http.ListenAndServe(addr, s.Handler())
+}
+
+// handleStatus returns a JSON snapshot of this node's identity and cluster view.
+// It is unauthenticated so the test script can poll it before sending any requests.
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	local := s.node.Gossip.LocalNode()
+	gossipAddr := local.Address()
+
+	members := s.node.Gossip.Members()
+	memberAddrs := make([]string, 0, len(members))
+	for _, m := range members {
+		memberAddrs = append(memberAddrs, m.Address())
+	}
+
+	communities := s.node.GetJoinedCommunities()
+	commStrs := make([]string, len(communities))
+	for i, c := range communities {
+		commStrs[i] = string(c)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"node_id":      string(s.node.NodeID),
+		"gossip_addr":  gossipAddr,
+		"gossip_port":  local.Port,
+		"gossip_peers": memberAddrs,
+		"member_count": len(members),
+		"communities":  commStrs,
+	})
 }
 
 func (s *Server) handleGetCommunities(w http.ResponseWriter, r *http.Request) {
@@ -152,19 +226,19 @@ func (s *Server) handleGetCommunities(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleJoinCommunity(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		CommunityID string `json:"community_id"`
-		UserID      string `json:"user_id"`
-	}
-	json.NewDecoder(r.Body).Decode(&req)
-
-	if req.UserID == "" {
+	userID, ok := s.validateToken(r)
+	if !ok {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
+	var req struct {
+		CommunityID string `json:"community_id"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
 	manager, _ := s.node.GetCommunity(models.CommunityID(req.CommunityID))
-	if manager != nil && isBanned(manager.GetModerationLog(), req.UserID) {
+	if manager != nil && isBanned(manager.GetModerationLog(), userID) {
 		http.Error(w, "You are banned from this community", http.StatusForbidden)
 		return
 	}
@@ -184,17 +258,20 @@ func (s *Server) handleGetPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// NEW: Scan the moderation log once to build a map of banned users and deleted posts
+	// Scan the moderation log once to build maps of removed posts and banned users.
 	deletedPosts := make(map[models.ContentHash]bool)
 	bannedUsers := make(map[string]bool)
 
-	for _, log := range manager.GetModerationLog() {
-		if string(log.ActionType) == "DELETE_POST" {
-			deletedPosts[log.TargetHash] = true
-		} else if string(log.ActionType) == "BAN_USER" {
-			bannedUsers[string(log.TargetHash)] = true
-		} else if string(log.ActionType) == "UNBAN_USER" {
-			bannedUsers[string(log.TargetHash)] = false
+	for _, entry := range manager.GetModerationLog() {
+		switch entry.ActionType {
+		case models.ModRemovePost:
+			deletedPosts[entry.TargetHash] = true
+		case models.ModRestorePost:
+			delete(deletedPosts, entry.TargetHash)
+		case models.ModBanUser:
+			bannedUsers[string(entry.TargetUser)] = true
+		case models.ModUnbanUser:
+			delete(bannedUsers, string(entry.TargetUser))
 		}
 	}
 
@@ -203,7 +280,7 @@ func (s *Server) handleGetPosts(w http.ResponseWriter, r *http.Request) {
 		*models.Post
 		Score int64 `json:"score"`
 	}
-	
+
 	var res []PostResponse
 	for _, p := range posts {
 		// NEW: Only add the post to the feed if it is NOT deleted AND the author is NOT banned
@@ -217,13 +294,15 @@ func (s *Server) handleGetPosts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
-	var post models.Post
-	json.NewDecoder(r.Body).Decode(&post)
-	
-	if string(post.AuthorID) == "" {
+	userID, ok := s.validateToken(r)
+	if !ok {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+
+	var post models.Post
+	json.NewDecoder(r.Body).Decode(&post)
+	post.AuthorID = models.UserID(userID) // always use server-validated identity
 
 	manager, err := s.node.GetCommunity(post.CommunityID)
 	if err != nil {
@@ -231,8 +310,7 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cast AuthorID to string for the isBanned function
-	if isBanned(manager.GetModerationLog(), string(post.AuthorID)) {
+	if isBanned(manager.GetModerationLog(), userID) {
 		http.Error(w, "You are banned from posting in this community", http.StatusForbidden)
 		return
 	}
@@ -253,20 +331,21 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetComments(w http.ResponseWriter, r *http.Request) {
 	commID := r.URL.Query().Get("community_id")
 	postHash := r.URL.Query().Get("post_hash")
-	
+
 	manager, err := s.node.GetCommunity(models.CommunityID(commID))
 	if err != nil {
 		http.Error(w, "Not a member", http.StatusNotFound)
 		return
 	}
 
-	// NEW: Scan the moderation log to build a map of banned users for comments
+	// Scan the moderation log to build the banned-users set.
 	bannedUsers := make(map[string]bool)
-	for _, log := range manager.GetModerationLog() {
-		if string(log.ActionType) == "BAN_USER" {
-			bannedUsers[string(log.TargetHash)] = true
-		} else if string(log.ActionType) == "UNBAN_USER" {
-			bannedUsers[string(log.TargetHash)] = false
+	for _, entry := range manager.GetModerationLog() {
+		switch entry.ActionType {
+		case models.ModBanUser:
+			bannedUsers[string(entry.TargetUser)] = true
+		case models.ModUnbanUser:
+			delete(bannedUsers, string(entry.TargetUser))
 		}
 	}
 
@@ -289,16 +368,18 @@ func (s *Server) handleGetComments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.validateToken(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	var req struct {
 		CommunityID string         `json:"community_id"`
 		Comment     models.Comment `json:"comment"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-
-	if string(req.Comment.AuthorID) == "" {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
+	req.Comment.AuthorID = models.UserID(userID) // always use server-validated identity
 
 	manager, err := s.node.GetCommunity(models.CommunityID(req.CommunityID))
 	if err != nil {
@@ -306,8 +387,7 @@ func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cast AuthorID to string for the isBanned function
-	if isBanned(manager.GetModerationLog(), string(req.Comment.AuthorID)) {
+	if isBanned(manager.GetModerationLog(), userID) {
 		http.Error(w, "You are banned from commenting in this community", http.StatusForbidden)
 		return
 	}
@@ -326,16 +406,18 @@ func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.validateToken(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	var req struct {
 		CommunityID string      `json:"community_id"`
 		Vote        models.Vote `json:"vote"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-
-	if string(req.Vote.UserID) == "" {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
+	req.Vote.UserID = models.UserID(userID) // always use server-validated identity
 
 	manager, err := s.node.GetCommunity(models.CommunityID(req.CommunityID))
 	if err != nil {
@@ -343,8 +425,7 @@ func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cast UserID to string for the isBanned function
-	if isBanned(manager.GetModerationLog(), string(req.Vote.UserID)) {
+	if isBanned(manager.GetModerationLog(), userID) {
 		http.Error(w, "You are banned from voting in this community", http.StatusForbidden)
 		return
 	}
@@ -364,11 +445,16 @@ func (s *Server) handleModerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userID, ok := s.validateToken(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	var req struct {
 		CommunityID string `json:"community_id"`
 		ActionType  string `json:"action_type"`
 		Target      string `json:"target"`
-		UserID      string `json:"user_id"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
@@ -378,19 +464,18 @@ func (s *Server) handleModerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authorization Guard
-	if req.UserID != "admin" {
+	// Authorization guard (compares against raw UI action type strings)
+	if userID != "admin" {
 		if req.ActionType == "BAN_USER" {
 			http.Error(w, "Forbidden: Only admins can ban users", http.StatusForbidden)
 			return
 		}
 		if req.ActionType == "DELETE_POST" {
-			// Users can only delete their own posts
+			// Non-admins can only delete their own posts
 			posts, _ := manager.GetPosts()
 			isAuthor := false
 			for _, p := range posts {
-				// Cast p.AuthorID to string to compare with req.UserID
-				if string(p.Hash) == req.Target && string(p.AuthorID) == req.UserID {
+				if string(p.Hash) == req.Target && string(p.AuthorID) == userID {
 					isAuthor = true
 					break
 				}
@@ -402,15 +487,33 @@ func (s *Server) handleModerate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Cast ActionType to your specific models.ModerationActionType
+	// Map UI action type strings to model constants and route target to the correct field.
 	action := models.ModerationAction{
 		CommunityID: models.CommunityID(req.CommunityID),
-		TargetHash:  models.ContentHash(req.Target),
-		ActionType:  models.ModerationActionType(req.ActionType),
+		ModeratorID: models.UserID(userID),
 		Reason:      "Moderated via API",
 	}
+	switch req.ActionType {
+	case "DELETE_POST":
+		action.ActionType = models.ModRemovePost
+		action.TargetHash = models.ContentHash(req.Target)
+	case "RESTORE_POST":
+		action.ActionType = models.ModRestorePost
+		action.TargetHash = models.ContentHash(req.Target)
+	case "DELETE_COMMENT":
+		action.ActionType = models.ModRemoveComment
+		action.TargetHash = models.ContentHash(req.Target)
+	case "BAN_USER":
+		action.ActionType = models.ModBanUser
+		action.TargetUser = models.UserID(req.Target)
+	case "UNBAN_USER":
+		action.ActionType = models.ModUnbanUser
+		action.TargetUser = models.UserID(req.Target)
+	default:
+		http.Error(w, "Unknown action type: "+req.ActionType, http.StatusBadRequest)
+		return
+	}
 
-	// Propose to Raft Consensus
 	if err := manager.Moderate(action); err != nil {
 		http.Error(w, "Raft consensus failed: "+err.Error(), http.StatusInternalServerError)
 		return

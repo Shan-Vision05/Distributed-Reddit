@@ -89,6 +89,7 @@
     <script>
         const API = 'http://localhost:8080/api';
         let USER_ID = localStorage.getItem('dreddit_user') || '';
+        let TOKEN   = localStorage.getItem('dreddit_token') || '';
         let activeCommunity = '';
         let openComments = new Set();
         let pollingInterval = null;
@@ -128,15 +129,19 @@
             
             const res = await fetch(`${API}${endpoint}`, {
                 method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username: u, password: p })
             });
 
             if (!res.ok) return alert(await res.text());
 
-            if (authMode === 'signup') alert("Account successfully created! You are now logged in.");
-
-            USER_ID = u;
+            const data = await res.json();
+            TOKEN   = data.token;
+            USER_ID = data.user_id;
+            localStorage.setItem('dreddit_token', TOKEN);
             localStorage.setItem('dreddit_user', USER_ID);
+
+            if (authMode === 'signup') alert('Account successfully created! You are now logged in.');
             hideLogin();
             updateAuthUI();
             loadPosts(); // Refresh view to show any mod buttons if admin
@@ -144,14 +149,16 @@
 
         function logout() {
             USER_ID = '';
+            TOKEN = '';
             localStorage.removeItem('dreddit_user');
+            localStorage.removeItem('dreddit_token');
             updateAuthUI();
             loadPosts(); // Refresh view to hide mod buttons
         }
 
         function requireAuth(event) {
             if (event) event.stopPropagation();
-            if (!USER_ID) {
+            if (!USER_ID || !TOKEN) {
                 showLogin();
                 return false;
             }
@@ -187,8 +194,9 @@
             if(!id) return;
             
             const res = await fetch(`${API}/join`, { 
-                method: 'POST', 
-                body: JSON.stringify({ community_id: id, user_id: USER_ID }) 
+                method: 'POST',
+                headers: { 'Authorization': 'Bearer ' + TOKEN },
+                body: JSON.stringify({ community_id: id }) 
             });
             
             if (!res.ok) return alert(await res.text());
@@ -272,11 +280,11 @@
 
             const res = await fetch(`${API}/moderate`, {
                 method: 'POST',
+                headers: { 'Authorization': 'Bearer ' + TOKEN },
                 body: JSON.stringify({
                     community_id: activeCommunity,
                     action_type: actionType,
-                    target: target,
-                    user_id: USER_ID
+                    target: target
                 })
             });
 
@@ -289,9 +297,10 @@
 
             const res = await fetch(`${API}/vote`, {
                 method: 'POST',
+                headers: { 'Authorization': 'Bearer ' + TOKEN },
                 body: JSON.stringify({
                     community_id: activeCommunity,
-                    vote: { target_hash: hash, user_id: USER_ID, value: value }
+                    vote: { target_hash: hash, value: value }
                 })
             });
             if (!res.ok) return alert(await res.text());
@@ -309,11 +318,15 @@
             if (!activeCommunity) return alert("Select a community first!");
             
             const post = {
-                community_id: activeCommunity, author_id: USER_ID,
+                community_id: activeCommunity,
                 title: document.getElementById('post-title').value,
                 body: document.getElementById('post-body').value
             };
-            const res = await fetch(`${API}/post`, { method: 'POST', body: JSON.stringify(post) });
+            const res = await fetch(`${API}/post`, {
+                method: 'POST',
+                headers: { 'Authorization': 'Bearer ' + TOKEN },
+                body: JSON.stringify(post)
+            });
             if (!res.ok) return alert(await res.text());
             
             document.getElementById('post-title').value = '';
@@ -356,9 +369,10 @@
             
             const res = await fetch(`${API}/comment`, {
                 method: 'POST',
+                headers: { 'Authorization': 'Bearer ' + TOKEN },
                 body: JSON.stringify({
                     community_id: activeCommunity,
-                    comment: { post_hash: postHash, author_id: USER_ID, body: body }
+                    comment: { post_hash: postHash, body: body }
                 })
             });
             if (!res.ok) return alert(await res.text());
