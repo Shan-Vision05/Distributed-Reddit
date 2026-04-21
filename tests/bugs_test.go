@@ -2,7 +2,6 @@ package tests
 
 import (
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -27,21 +26,17 @@ func waitForCondition(t *testing.T, desc string, fn func() bool, timeout time.Du
 }
 
 // makeTestNode creates a node with a unique ID and wires cleanup.
+// makeTestNode creates a node with a unique ID, isolated temp data dir, and wires cleanup.
 func makeTestNode(t *testing.T, id string) *node.Node {
 	t.Helper()
-	n, err := node.NewNode(models.NodeID(id), "127.0.0.1")
+	tmpDir := t.TempDir()
+	cfg := node.NodeConfig{DataDir: tmpDir}
+	n, err := node.NewNodeWithConfig(models.NodeID(id), "127.0.0.1", cfg)
 	if err != nil {
 		t.Fatalf("NewNode(%s): %v", id, err)
 	}
 	t.Cleanup(func() {
 		n.Gossip.Shutdown()
-		// Remove Raft data directories created under the tests/ working directory.
-		entries, _ := os.ReadDir(".")
-		for _, e := range entries {
-			if len(e.Name()) >= 5 && e.Name()[:5] == "data_" {
-				os.RemoveAll(e.Name())
-			}
-		}
 	})
 	return n
 }

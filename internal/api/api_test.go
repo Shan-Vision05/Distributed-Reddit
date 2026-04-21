@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 	"time"
 
@@ -32,25 +31,18 @@ func waitFor(t *testing.T, desc string, fn func() bool, timeout time.Duration) {
 	t.Fatalf("timed out waiting for: %s", desc)
 }
 
-// newTestNode creates a Node and registers cleanup to shut down gossip and
-// remove any Raft data directories created under the working directory.
+// newTestNode creates a Node with an isolated temporary data directory and
+// registers cleanup to shut down gossip on test completion.
 func newTestNode(t *testing.T, nodeID string) *node.Node {
 	t.Helper()
-	n, err := node.NewNode(models.NodeID(nodeID), "127.0.0.1")
+	tmpDir := t.TempDir()
+	cfg := node.NodeConfig{DataDir: tmpDir}
+	n, err := node.NewNodeWithConfig(models.NodeID(nodeID), "127.0.0.1", cfg)
 	if err != nil {
 		t.Fatalf("NewNode(%s): %v", nodeID, err)
 	}
 	t.Cleanup(func() {
 		n.Gossip.Shutdown()
-		// Remove raft data directories created during the test.
-		entries, _ := os.ReadDir(".")
-		for _, e := range entries {
-			if len(e.Name()) > len(nodeID)+1 &&
-				e.Name()[:len(nodeID)+1] == nodeID+"_" ||
-				(len(e.Name()) > 5 && e.Name()[:5] == "data_") {
-				os.RemoveAll(e.Name())
-			}
-		}
 	})
 	return n
 }
@@ -58,13 +50,9 @@ func newTestNode(t *testing.T, nodeID string) *node.Node {
 // newTestServer wraps a node in an httptest.Server and handles cleanup.
 func newTestServer(t *testing.T, n *node.Node) *httptest.Server {
 	t.Helper()
-	s := api.NewServer(n)
+	s := api.NewServer(n, t.TempDir()) // isolated auth data per test
 	srv := httptest.NewServer(s.Handler())
-	t.Cleanup(func() {
-		srv.Close()
-		// Remove the users.json created in the test working directory.
-		os.Remove("users.json")
-	})
+	t.Cleanup(srv.Close)
 	return srv
 }
 
