@@ -15,6 +15,8 @@ WRITE_SAMPLES="${EVAL_WRITE_SAMPLES:-60}"
 FAILOVER_SAMPLES="${EVAL_FAILOVER_SAMPLES:-50}"
 THROUGHPUT_DURATION="${EVAL_THROUGHPUT_DURATION:-8}"
 THROUGHPUT_CONCURRENCY="${EVAL_THROUGHPUT_CONCURRENCY:-12}"
+FAILOVER_CONNECT_TIMEOUT="${EVAL_FAILOVER_CONNECT_TIMEOUT:-1}"
+FAILOVER_MAX_TIME="${EVAL_FAILOVER_MAX_TIME:-20}"
 
 PASS=0
 FAIL=0
@@ -39,6 +41,11 @@ pass() { echo -e "  \033[32mPASS\033[0m  $1"; PASS=$((PASS + 1)); }
 fail() { echo -e "  \033[31mFAIL\033[0m  $1"; FAIL=$((FAIL + 1)); }
 note() { echo "  INFO  $1"; }
 
+cleanup_stale_eval_state() {
+    pkill -f 'dreddit -id eval-node' 2>/dev/null || true
+    find /tmp -maxdepth 1 -type d -name 'dreddit_eval_*' -prune -exec rm -rf {} + 2>/dev/null || true
+}
+
 cleanup() {
     for pid in "${PIDS[@]:-}"; do
         if [[ -n "$pid" ]]; then
@@ -48,7 +55,7 @@ cleanup() {
     wait 2>/dev/null || true
     rm -rf "$TEST_DIR"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM HUP QUIT
 
 require() {
     command -v "$1" >/dev/null 2>&1 || {
@@ -61,7 +68,7 @@ wait_for() {
     local url=$1
     local timeout_seconds=${2:-40}
     local attempts=0
-    until curl -sf "$url" >/dev/null 2>&1; do
+    until curl --connect-timeout 1 --max-time 2 -sf "$url" >/dev/null 2>&1; do
         sleep 0.5
         attempts=$((attempts + 1))
         if (( attempts > timeout_seconds * 2 )); then
@@ -450,12 +457,12 @@ wait_for_membership() {
             if [[ -z "${PIDS[$i]:-}" ]]; then
                 continue
             fi
-            if ! curl -sf "http://127.0.0.1:${HTTP_PORTS[$i]}/api/status" >/dev/null 2>&1; then
+            if ! curl --connect-timeout 1 --max-time 2 -sf "http://127.0.0.1:${HTTP_PORTS[$i]}/api/status" >/dev/null 2>&1; then
                 ready=0
                 break
             fi
             local count
-            count="$(curl -sf "http://127.0.0.1:${HTTP_PORTS[$i]}/api/status" | json_get member_count)"
+            count="$(curl --connect-timeout 1 --max-time 2 -sf "http://127.0.0.1:${HTTP_PORTS[$i]}/api/status" | json_get member_count)"
             if [[ ! "$count" =~ ^[0-9]+$ ]] || (( count < expected )); then
                 ready=0
                 break
@@ -545,9 +552,9 @@ fallback_request_sample() {
             fi
             url="http://127.0.0.1:${HTTP_PORTS[$i]}/api/vote"
             body="{\"community_id\":\"${COMMUNITY_ID}\",\"vote\":{\"target_hash\":\"${SEED_POST_HASH}\",\"value\":${value}}}"
-            meta="$(curl --connect-timeout 0.5 --max-time 1.5 -sS -o "$output_file" -w "%{http_code} %{time_total}" -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${token}" -d "$body" "$url" 2>/dev/null || echo "000 1.5")"
+            meta="$(curl --connect-timeout "$FAILOVER_CONNECT_TIMEOUT" --max-time "$FAILOVER_MAX_TIME" -sS -o "$output_file" -w "%{http_code} %{time_total}" -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${token}" -d "$body" "$url" 2>/dev/null || echo "000 ${FAILOVER_MAX_TIME}")"
         else
-            meta="$(curl --connect-timeout 0.5 --max-time 1.5 -sS -o "$output_file" -w "%{http_code} %{time_total}" -X GET -H "Content-Type: application/json" -H "Authorization: Bearer ${token}" "$url" 2>/dev/null || echo "000 1.5")"
+            meta="$(curl --connect-timeout "$FAILOVER_CONNECT_TIMEOUT" --max-time "$FAILOVER_MAX_TIME" -sS -o "$output_file" -w "%{http_code} %{time_total}" -X GET -H "Content-Type: application/json" -H "Authorization: Bearer ${token}" "$url" 2>/dev/null || echo "000 ${FAILOVER_MAX_TIME}")"
         fi
         rm -f "$output_file"
         code="${meta%% *}"
@@ -628,6 +635,8 @@ restart_node() {
 require curl
 require python3
 require go
+
+cleanup_stale_eval_state
 
 if (( NODE_COUNT < 15 )); then
     echo "EVAL_NODE_COUNT must be at least 15 to match the evaluation protocol." >&2
@@ -759,11 +768,14 @@ else
     fail "some failover operations did not succeed"
 fi
 
-restart_node 0
-if wait_for_membership "$NODE_COUNT" 80; then
-    pass "cluster recovered to full membership after leader restart"
+if restart_node 0; then
+    if wait_for_membership "$NODE_COUNT" 80; then
+        pass "cluster recovered to full membership after leader restart"
+    else
+        fail "cluster did not recover to full membership after leader restart"
+    fi
 else
-    fail "cluster did not recover to full membership after leader restart"
+    fail "leader restart failed after failover experiment"
 fi
 
 echo
@@ -785,7 +797,9 @@ for index in 1 2 3; do
             churn_write_success=$((churn_write_success + 1))
         fi
     done
-    restart_node "$index"
+    if ! restart_node "$index"; then
+        fail "node $((index + 1)) failed to restart during churn"
+    fi
 done
 summarize_samples "churn read latency" "$CHURN_READ_FILE"
 summarize_samples "churn write latency" "$CHURN_WRITE_FILE"
